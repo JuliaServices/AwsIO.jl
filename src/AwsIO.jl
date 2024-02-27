@@ -1,4 +1,4 @@
-module Example
+module AwsIO
 export hello, domath
 
 """
