@@ -1,6 +1,11 @@
-name = "Example"
-uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+name = "AwsIO"
+uuid = "4047365c-aa37-44ec-b1fa-4c0d5495ccf1"
 version = "1.0.0"
+
+[deps]
+AwsC = "e152505b-a699-490f-9541-997267120aa8"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+aws_c_io_jll = "13c41daa-f319-5298-b5eb-5754e0170d52"
 
 [compat]
 julia = "1.6"
