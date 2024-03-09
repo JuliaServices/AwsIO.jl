@@ -1,9 +1,9 @@
 module LibAwsIO
 
-import AwsC.LibAwsC: aws_allocator, aws_default_allocator, aws_byte_buf, aws_byte_cursor, aws_mem_acquire, aws_mem_release, aws_throw_error
+import AwsC.LibAwsC: aws_allocator, aws_default_allocator, aws_byte_buf, aws_byte_cursor, aws_mem_acquire, aws_mem_release, aws_throw_error, aws_linked_list_node
 
-using aws_c_io_jll
-# const libaws_c_io = "/Users/jacob.quinn/aws-crt/lib/libaws-c-io.1.0.0.dylib"
+# using aws_c_io_jll
+const libaws_c_io = "/Users/jacob.quinn/aws-crt/lib/libaws-c-io.1.0.0.dylib"
 
 include("io_errors.jl")
 
@@ -73,7 +73,7 @@ end
     AWS_CHANNEL_DIR_WRITE = 1
 end
 
-mutable struct aws_channel_handler_vtable
+struct aws_channel_handler_vtable
     process_read_message::Ptr{Cvoid}
     process_write_message::Ptr{Cvoid}
     increment_read_window::Ptr{Cvoid}
@@ -83,17 +83,32 @@ mutable struct aws_channel_handler_vtable
     destroy::Ptr{Cvoid}
 end
 
-mutable struct aws_channel_handler
-    vtable::aws_channel_handler_vtable
+struct aws_channel_handler
+    vtable::Base.RefValue{aws_channel_handler_vtable}
     allocator::Ptr{aws_allocator}
     slot::Ptr{aws_channel_slot}
-    impl::Any
+    impl::Ptr{Cvoid}
 end
 
-const aws_io_message = Cvoid
+struct aws_linked_list_node2
+    next::Ptr{Cvoid}
+    prev::Ptr{Cvoid}
+end
 
-get_message_data(msg::Ptr{aws_io_message}) = unsafe_load(Ptr{aws_byte_buf}(Ptr{UInt8}(msg) + sizeof(Ptr)))
-set_message_data!(msg::Ptr{aws_io_message}, data::aws_byte_buf) = unsafe_store!(Ptr{aws_byte_buf}(Ptr{UInt8}(msg) + sizeof(Ptr)), data)
+struct aws_io_message
+    allocator::Ptr{aws_allocator}
+    message_data::aws_byte_buf
+    message_type::Cint
+    message_tag::Cint
+    copy_mark::Csize_t
+    owning_channel::Ptr{aws_channel}
+    on_completion::Ptr{Cvoid}
+    user_data::Ptr{Cvoid}
+    queueing_handle::aws_linked_list_node2
+end
+
+get_message_data(msg::Ptr{aws_io_message}) = unsafe_load(Ptr{aws_byte_buf}(msg + Base.fieldoffset(aws_io_message, 2)))
+set_message_data!(msg::Ptr{aws_io_message}, data::aws_byte_buf) = unsafe_store!(Ptr{aws_byte_buf}(msg + Base.fieldoffset(aws_io_message, 2)), data)
 get_allocator(msg::Ptr{aws_io_message}) = unsafe_load(Ptr{Ptr{aws_allocator}}(msg))
 
 function aws_channel_slot_increment_read_window(slot, size)
@@ -109,7 +124,7 @@ function aws_channel_acquire_message_from_pool(channel, size_hint)
 end
 
 function aws_channel_slot_send_message(slot, message, dir)
-    @ccall libaws_c_io.aws_channel_slot_send_message(slot::Ptr{aws_channel_slot}, message::Ptr{Cvoid}, dir::Cint)::Cint
+    @ccall libaws_c_io.aws_channel_slot_send_message(slot::Ptr{aws_channel_slot}, message::Ptr{aws_io_message}, dir::Cint)::Cint
 end
 
 function aws_channel_slot_new(channel)
@@ -128,12 +143,8 @@ function aws_channel_slot_insert_left(slot, to_add)
     @ccall libaws_c_io.aws_channel_slot_insert_left(slot::Ptr{aws_channel_slot}, to_add::Ptr{aws_channel_slot})::Cint
 end
 
-function aws_channel_get_first_slot(channel)
-    @ccall libaws_c_io.aws_channel_get_first_slot(channel::Ptr{aws_channel})::Ptr{aws_channel_slot}
-end
-
 function aws_channel_slot_set_handler(slot, handler)
-    @ccall libaws_c_io.aws_channel_slot_set_handler(slot::Ptr{Cvoid}, handler::Any)::Cint
+    @ccall libaws_c_io.aws_channel_slot_set_handler(slot::Ptr{Cvoid}, handler::Ref{aws_channel_handler})::Cint
 end
 
 function aws_channel_slot_set_handler(slot, handler::Ptr{Cvoid})
@@ -264,7 +275,7 @@ function tlsoptions(host_str::String;
     on_negotiation_result=C_NULL,
     user_data=C_NULL
 )
-    tls_options = aws_mem_acquire(allocator, 64)
+    tls_options = aws_mem_acquire(allocator, 128)
     tls_ctx_options = aws_mem_acquire(allocator, 512)
     tls_ctx = C_NULL
     try
@@ -297,6 +308,12 @@ function tlsoptions(host_str::String;
         aws_mem_release(allocator, tls_ctx_options)
     end
     return tls_options
+end
+
+function tlsoptions_cleanup(opts)
+    aws_tls_connection_options_clean_up(opts)
+    aws_mem_release(aws_default_allocator(), opts)
+    return
 end
 
 function aws_socket_channel_bootstrap_options(host::AbstractString, port::Integer;
@@ -356,16 +373,32 @@ function aws_socket_channel_bootstrap_options(host::AbstractString, port::Intege
     return x
 end
 
-function aws_tls_client_handler_new(allocator, options, slot)
-    @ccall libaws_c_io.aws_tls_client_handler_new(allocator::Ptr{aws_allocator}, options::Ptr{aws_tls_connection_options}, slot::Ptr{aws_channel_slot})::Ptr{Cvoid}
-end
-
 function aws_tls_client_handler_start_negotiation(handler)
     @ccall libaws_c_io.aws_tls_client_handler_start_negotiation(handler::Ptr{Cvoid})::Cint
 end
 
 function aws_channel_shutdown(channel, error_code)
     @ccall libaws_c_io.aws_channel_shutdown(channel::Ptr{aws_channel}, error_code::Cint)::Cint
+end
+
+function aws_channel_get_first_slot(channel)
+    @ccall libaws_c_io.aws_channel_get_first_slot(channel::Ptr{aws_channel})::Ptr{aws_channel_slot}
+end
+
+function aws_channel_setup_client_tls(slot, tls_options)
+    @ccall libaws_c_io.aws_channel_setup_client_tls(slot::Ptr{aws_channel_slot}, tls_options::Ptr{aws_tls_connection_options})::Cint
+end
+
+function aws_app_client_handler_new(allocator, channel, on_read, user_data)
+    @ccall libaws_c_io.aws_app_client_handler_new(allocator::Ptr{aws_allocator}, channel::Ptr{aws_channel}, on_read::Ptr{Cvoid}, user_data::Any)::Ptr{Cvoid}
+end
+
+function aws_app_client_handler_write(handler, buffer, on_completed, user_data)
+    @ccall libaws_c_io.aws_app_client_handler_write(handler::Ptr{Cvoid}, buffer::Ref{aws_byte_buf}, on_completed::Ptr{Cvoid}, user_data::Any)::Cvoid
+end
+
+function aws_app_client_handler_tls_upgrade(allocator, channel, host_name, on_negotiation_result, user_data)
+    @ccall libaws_c_io.aws_app_client_handler_tls_upgrade(allocator::Ptr{aws_allocator}, channel::Ptr{aws_channel}, host_name::Ptr{Cchar}, on_negotiation_result::Ptr{Cvoid}, user_data::Any)::Cint
 end
 
 precompiling() = ccall(:jl_generating_output, Cint, ()) == 1
