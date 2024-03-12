@@ -45,7 +45,6 @@ function c_increment_read_window(handler, slot, size)::Cint
 end
 
 function c_shutdown(handler, slot, dir, error_code, free_scarce_resources_immediately)::Cint
-    Core.println("c_shutdown: $slot")
     handler.impl.debug && @warn "c_shutdown: dir = $dir"
     close(handler.impl.ch, SocketError(error_str(error_code)))
     return aws_channel_slot_on_handler_shutdown_complete(slot, dir, error_code, free_scarce_resources_immediately)
