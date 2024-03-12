@@ -21,13 +21,14 @@ end
 function c_process_read_message(handler, slot, messageptr)::Cint
     data = get_message_data(messageptr)
     handler.impl.debug && @info "c_process_read_message: $(data.len) bytes"
-    if isopen(handler.impl.readbuf)
+    ret = ERROR
+    try
         unsafe_write(handler.impl.readbuf, data.buffer, data.len)
         ret = SUCCESS
-    else
-        ret = ERROR
+        mem_release(get_allocator(messageptr), messageptr)
+    catch e
+        close(handler.impl.ch, e)
     end
-    mem_release(get_allocator(messageptr), messageptr)
     return ret
 end
 
