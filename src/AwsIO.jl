@@ -18,6 +18,9 @@ struct SocketError <: Exception
     msg::String
 end
 
+sockerr(msg::String) = CapturedException(SocketError(msg), Base.backtrace())
+sockerr(e::Exception) = CapturedException(e, Base.backtrace())
+
 function c_process_read_message(handler, slot, messageptr)::Cint
     data = get_message_data(messageptr)
     handler.impl.debug && @info "c_process_read_message: $(data.len) bytes"
@@ -27,7 +30,7 @@ function c_process_read_message(handler, slot, messageptr)::Cint
         ret = SUCCESS
         mem_release(get_allocator(messageptr), messageptr)
     catch e
-        close(handler.impl.ch, e)
+        close(handler.impl.ch, sockerr(e))
     end
     return ret
 end
@@ -46,7 +49,7 @@ end
 
 function c_shutdown(handler, slot, dir, error_code, free_scarce_resources_immediately)::Cint
     handler.impl.debug && @warn "c_shutdown: dir = $dir"
-    close(handler.impl.ch, SocketError(error_str(error_code)))
+    close(handler.impl.ch, sockerr(error_str(error_code)))
     return aws_channel_slot_on_handler_shutdown_complete(slot, dir, error_code, free_scarce_resources_immediately)
 end
 
@@ -79,21 +82,21 @@ const RW_HANDLER_VTABLE = Ref{aws_channel_handler_vtable}()
 function c_setup_callback(bootstrap, error_code, channel, socket)
     if error_code != 0
         socket.debug && @error "c_setup_callback: error = '$(error_str(error_code))'"
-        close(socket.ch, SocketError(error_str(error_code)))
+        close(socket.ch, sockerr(error_str(error_code)))
     else
         slot = aws_channel_slot_new(channel)
         if slot == C_NULL
             socket.debug && @error "c_setup_callback: failed to create channel slot"
-            close(socket.ch, SocketError("failed to create channel slot"))
+            close(socket.ch, sockerr("failed to create channel slot"))
         end
         if aws_channel_slot_insert_end(channel, slot) != 0
             socket.debug && @error "c_setup_callback: failed to insert channel slot"
-            close(socket.ch, SocketError("failed to insert channel slot"))
+            close(socket.ch, sockerr("failed to insert channel slot"))
         end
         handler = aws_channel_handler(RW_HANDLER_VTABLE[], AwsC.allocator(), C_NULL, socket)
         if aws_channel_slot_set_handler(slot, handler) != 0
             socket.debug && @error "c_setup_callback: failed to set channel slot handler"
-            close(socket.ch, SocketError("failed to set channel slot handler"))
+            close(socket.ch, sockerr("failed to set channel slot handler"))
         end
         socket.channel = channel
         socket.slot = slot
@@ -160,7 +163,7 @@ function c_scheduled_write(channel_task, (socket, n), status)
             msgptr = aws_channel_acquire_message_from_pool(socket.channel, n - bytes_written)
             if msgptr == C_NULL
                 socket.debug && @error "c_scheduled_write: failed to acquire message from pool"
-                close(socket.ch, SocketError("failed to acquire message from pool"))
+                close(socket.ch, sockerr("failed to acquire message from pool"))
                 @goto done
             end
             data = get_message_data(msgptr)
@@ -172,14 +175,14 @@ function c_scheduled_write(channel_task, (socket, n), status)
             if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
                 mem_release(AwsC.allocator(), msgptr)
                 socket.debug && @error "c_scheduled_write: failed to send message"
-                close(socket.ch, SocketError("failed to send message"))
+                close(socket.ch, sockerr("failed to send message"))
                 @goto done
             end
             bytes_written += cap
         end
     else
         socket.debug && @warn "c_scheduled_write: task cancelled"
-        close(socket.ch, SocketError("task cancelled"))
+        close(socket.ch, sockerr("task cancelled"))
         @goto done
     end
     put!(socket.ch, :write_completed)
@@ -229,7 +232,7 @@ end
 function c_on_negotiation_result(handler, slot, error_code, sock)
     if error_code != 0
         sock.debug && @error "c_on_negotiation_result: error = '$(error_str(error_code))'"
-        close(sock.ch, SocketError(error_str(error_code)))
+        close(sock.ch, sockerr(error_str(error_code)))
     else
         put!(sock.ch, :negotiated)
     end
@@ -259,23 +262,23 @@ function tlsupgrade!(sock::Socket;
     )
     slot = aws_channel_slot_new(sock.channel)
     if slot == C_NULL
-        throw(SocketError("failed to create channel slot for tlsupgrade"))
+        throw(sockerr("failed to create channel slot for tlsupgrade"))
     end
     channel_handler = aws_tls_client_handler_new(AwsC.allocator(), tls_options, slot)
     if channel_handler == C_NULL
-        throw(SocketError("failed to create tls client handler"))
+        throw(sockerr("failed to create tls client handler"))
     end
     # options are copied in aws_tls_client_handler_new, so we can free them now
     aws_tls_connection_options_clean_up(tls_options)
     mem_release(AwsC.allocator(), tls_options)
     if aws_channel_slot_insert_left(sock.slot, slot) != 0
-        throw(SocketError("failed to insert channel slot for tlsupgrade"))
+        throw(sockerr("failed to insert channel slot for tlsupgrade"))
     end
     if aws_channel_slot_set_handler(slot, channel_handler) != 0
-        throw(SocketError("failed to set tls client handler"))
+        throw(sockerr("failed to set tls client handler"))
     end
     if aws_tls_client_handler_start_negotiation(channel_handler) != 0
-        throw(SocketError("failed to start tls negotiation"))
+        throw(sockerr("failed to start tls negotiation"))
     end
     take!(sock.ch) # wait for tls negotiation
     return
