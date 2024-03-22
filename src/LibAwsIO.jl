@@ -2,8 +2,8 @@ module LibAwsIO
 
 import AwsC.LibAwsC: aws_allocator, aws_default_allocator, aws_byte_buf, aws_byte_cursor, aws_mem_acquire, aws_mem_release, aws_throw_error
 
-using aws_c_io_jll
-# const libaws_c_io = "/Users/jacob.quinn/aws-crt/lib/libaws-c-io.1.0.0.dylib"
+# using aws_c_io_jll
+const libaws_c_io = "/app/aws-crt/lib/libaws-c-io.1.0.0.dylib"
 
 include("io_errors.jl")
 
