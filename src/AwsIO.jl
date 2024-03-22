@@ -241,6 +241,47 @@ end
 
 const ON_NEGOTIATION_RESULT = Ref{Ptr{Cvoid}}(C_NULL)
 
+function c_tls_upgrade(channel_task, (sock, tls_options), status)
+    if status == Int(AWS_TASK_STATUS_RUN_READY)
+        sock.debug && @info "c_tls_upgrade: initiating tls upgrade"
+        slot = aws_channel_slot_new(sock.channel)
+        if slot == C_NULL
+            close(sock.ch, sockerr("failed to create channel slot for tlsupgrade"))
+            @goto done
+        end
+        channel_handler = aws_tls_client_handler_new(AwsC.allocator(), tls_options, slot)
+        if channel_handler == C_NULL
+            close(sock.ch, sockerr("failed to create tls client handler"))
+            @goto done
+        end
+        # options are copied in aws_tls_client_handler_new, so we can free them now
+        # aws_tls_connection_options_clean_up(tls_options)
+        # mem_release(AwsC.allocator(), tls_options)
+        if aws_channel_slot_insert_left(sock.slot, slot) != 0
+            close(sock.ch, sockerr("failed to insert channel slot for tlsupgrade"))
+            @goto done
+        end
+        if aws_channel_slot_set_handler(slot, channel_handler) != 0
+            close(sock.ch, sockerr("failed to set tls client handler"))
+            @goto done
+        end
+        if aws_tls_client_handler_start_negotiation(channel_handler) != 0
+            close(sock.ch, sockerr("failed to start tls negotiation"))
+            @goto done
+        end
+    else
+        sock.debug && @warn "c_tls_upgrade: task cancelled"
+        close(socket.ch, sockerr("task cancelled"))
+        @goto done
+    end
+@label done
+    mem_release(AwsC.allocator(), channel_task)
+    sock.debug && @info "c_tls_upgrade: tls upgrade completed"
+    return
+end
+
+const TLS_UPGRADE = Ref{Ptr{Cvoid}}(C_NULL)
+
 function tlsupgrade!(sock::Socket;
         ssl_cert::Union{String, Nothing}=nothing,
         ssl_key::Union{String, Nothing}=nothing,
@@ -260,27 +301,8 @@ function tlsupgrade!(sock::Socket;
         on_negotiation_result=ON_NEGOTIATION_RESULT[],
         user_data=sock
     )
-    slot = aws_channel_slot_new(sock.channel)
-    if slot == C_NULL
-        throw(sockerr("failed to create channel slot for tlsupgrade"))
-    end
-    channel_handler = aws_tls_client_handler_new(AwsC.allocator(), tls_options, slot)
-    if channel_handler == C_NULL
-        throw(sockerr("failed to create tls client handler"))
-    end
-    # options are copied in aws_tls_client_handler_new, so we can free them now
-    aws_tls_connection_options_clean_up(tls_options)
-    mem_release(AwsC.allocator(), tls_options)
-    if aws_channel_slot_insert_left(sock.slot, slot) != 0
-        throw(sockerr("failed to insert channel slot for tlsupgrade"))
-    end
-    if aws_channel_slot_set_handler(slot, channel_handler) != 0
-        throw(sockerr("failed to set tls client handler"))
-    end
-    if aws_tls_client_handler_start_negotiation(channel_handler) != 0
-        throw(sockerr("failed to start tls negotiation"))
-    end
-    take!(sock.ch) # wait for tls negotiation
+    schedule_channel_task(sock.channel, TLS_UPGRADE[], (sock, tls_options), "socket channel tls upgrade")
+    take!(sock.ch) # wait for tls upgrade completion
     return
 end
 
@@ -298,6 +320,7 @@ function __init__()
         @cfunction(c_destroy, Cvoid, (Ref{aws_channel_handler},))
     )
     ON_NEGOTIATION_RESULT[] = @cfunction(c_on_negotiation_result, Cvoid, (Ptr{Cvoid}, Ptr{aws_channel_slot}, Cint, Any))
+    TLS_UPGRADE[] = @cfunction(c_tls_upgrade, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
     return
 end
 
