@@ -1,8 +1,8 @@
 # AwsIO.jl
 
-Wrapper library for the https://github.com/awslabs/aws-c-io library.
+Wrapper library for functionality in the https://github.com/awslabs/aws-c-io library.
 
-The `LibAwsIO` module (exported) aims to directly wrap and expose aws-c-io functionality (matching
+The `LibAwsIO` package aims to directly wrap and expose aws-c-io functionality (matching
 data structures and api functions exactly).
 
 The functions and structures in `AwsIO` are more Julia-like and are intended to be more user-friendly,
