@@ -295,6 +295,7 @@ Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer) = unsafe_read(sock.r
 
 Base.skip(sock::Client, n) = skip(sock.readbuf, n)
 Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
+Base.eof(sock::Client) = eof(sock.readbuf)
 Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
 Base.readbytes!(sock::Client, buf::Vector{UInt8}, nb=length(buf)) = readbytes!(sock.readbuf, buf, nb)
 
