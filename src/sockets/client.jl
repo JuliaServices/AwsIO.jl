@@ -297,7 +297,7 @@ Base.skip(sock::Client, n) = skip(sock.readbuf, n)
 Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
 Base.eof(sock::Client) = eof(sock.readbuf)
 Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
-Base.readbytes!(sock::Client, buf::Vector{UInt8}, nb=length(buf)) = readbytes!(sock.readbuf, buf, nb)
+Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, nb=length(buf)) = readbytes!(sock.readbuf, buf, nb)
 
 function Base.close(sock::Client)
     close(sock.ch)
