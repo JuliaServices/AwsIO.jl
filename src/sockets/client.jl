@@ -83,7 +83,7 @@ mutable struct Client
             )
         end
         if tls && tls_options === nothing
-            tls_options = tlsoptions(host;
+            tls_options = LibAwsIO.tlsoptions(host;
                 ssl_cert,
                 ssl_key,
                 ssl_capath,
@@ -294,8 +294,9 @@ Base.read(sock::Client, n::Integer) = read(sock.readbuf, n)
 Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer) = unsafe_read(sock.readbuf, ptr, n)
 
 Base.skip(sock::Client, n) = skip(sock.readbuf, n)
-
-Base.isopen(sock::Client) = isopen(sock.ch)
+Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
+Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
+Base.readbytes!(sock::Client, buf::Vector{UInt8}, nb=length(buf)) = readbytes!(sock.readbuf, buf, nb)
 
 function Base.close(sock::Client)
     close(sock.ch)
@@ -374,7 +375,7 @@ function tlsupgrade!(sock::Client;
         ssl_insecure::Bool=false,
         ssl_alpn_list::Union{String, Nothing}=nothing
     )
-    tls_options = tlsoptions(
+    tls_options = LibAwsIO.tlsoptions(
         sock.host;
         ssl_cert=ssl_cert,
         ssl_key=ssl_key,
