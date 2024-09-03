@@ -79,7 +79,8 @@ mutable struct Client
                 keep_alive_interval_sec,
                 keep_alive_timeout_sec,
                 keep_alive_max_failed_probes,
-                keepalive
+                keepalive,
+                ntuple(i -> Cchar(0), 16)
             )
         end
         if tls && tls_options === nothing
