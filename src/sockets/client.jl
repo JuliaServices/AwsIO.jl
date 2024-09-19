@@ -263,7 +263,7 @@ function c_scheduled_write(channel_task, arg, status)
 @label done
     finally
         aws_mem_release(default_aws_allocator(), channel_task)
-        socket.debug && @info "c_scheduled_write: write completed"
+        arg.socket.debug && @info "c_scheduled_write: write completed"
     end
     return
 end
