@@ -224,8 +224,8 @@ function schedule_channel_task(channel, task_fn, arg, type_tag)
 end
 
 function c_scheduled_write(channel_task, arg, status)
+    socket = arg.socket
     if status == Int(AWS_TASK_STATUS_RUN_READY)
-        socket = arg.socket
         n = arg.n
         socket.debug && @info "c_scheduled_write: writing $n bytes"
         buf = aws_byte_buf(0, pointer(socket.writebuf.data), n, C_NULL)
