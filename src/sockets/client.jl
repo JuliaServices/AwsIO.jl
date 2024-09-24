@@ -337,7 +337,7 @@ end
 function Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, n::Integer=length(buf))
     readbytes!(sock.readbuf, buf, n)
     maybe_increment_read_window(sock, n, "Base.readbytes!")
-    return
+    return n
 end
 
 function Base.read(sock::Client, n::Integer)
