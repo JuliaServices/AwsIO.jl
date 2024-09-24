@@ -313,7 +313,7 @@ Base.flush(sock::Client) = flush(sock.writebuf)
 function maybe_increment_read_window(sock::Client, nread)
     ba = bytesavailable(sock.readbuf)
     slotobj = unsafe_load(sock.slot)
-    available_space = sock.buffer_capacity - slobobj.window_size
+    available_space = sock.buffer_capacity - slotobj.window_size
     if available_space >= (sock.buffer_capacity ÷ 32)
         sock.debug && @info "maybe_increment_read_window: $nread bytes just read, $ba bytes available, incrementing read window by $available_space, $(slotobj.window_size) window size"
         aws_channel_slot_increment_read_window(sock.slot, available_space)
