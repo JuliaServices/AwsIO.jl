@@ -6,10 +6,8 @@ version = "1.0.0"
 LibAwsCommon = "c6e421ba-b5f8-4792-a1c4-42948de3ed9d"
 LibAwsIO = "a5388770-19df-4151-b103-3d71de896ddf"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
-SimpleBufferStream = "777ac1f9-54b0-4bf8-805c-2214025038e7"
 
 [compat]
-SimpleBufferStream = "1.2.0"
 julia = "1.6"
 
 [extras]

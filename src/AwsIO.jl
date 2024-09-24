@@ -2,7 +2,7 @@ module AwsIO
 
 module Sockets
 
-using Logging, LibAwsCommon, LibAwsIO, SimpleBufferStream
+using Logging, LibAwsCommon, LibAwsIO
 
 struct SocketError <: Exception
     msg::String

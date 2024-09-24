@@ -41,7 +41,7 @@ mutable struct Client <: IO
     channel::Ptr{aws_channel}
     slot::Ptr{aws_channel_slot}
     ch::Channel{Symbol}
-    readbuf::BufferStream
+    readbuf::Base.BufferStream
     accumulated_read_count::Int
     writelock::ReentrantLock
     writebuf::IOBuffer
@@ -98,7 +98,7 @@ mutable struct Client <: IO
                 ssl_alpn_list
             )
         end
-        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), BufferStream(), 0, ReentrantLock(), PipeBuffer())
+        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), 0, ReentrantLock(), PipeBuffer())
         GC.@preserve x begin
             x.bootstrap = aws_socket_channel_bootstrap_options(
                 client_bootstrap,
@@ -313,10 +313,10 @@ Base.flush(sock::Client) = flush(sock.writebuf)
 
 function maybe_increment_read_window(sock::Client, nread, from)
     acc = sock.accumulated_read_count += nread
-    ba = length(sock.readbuf)
+    ba = bytesavailable(sock.readbuf)
     slotobj = unsafe_load(sock.slot)
     sock.debug && @info "($(objectid(sock))), ($(from)): maybe_increment_read_window: $nread bytes just read, $ba bytes available, accumulated increment read count $acc, $(slotobj.window_size) window size"
-    if acc >= 4096
+    if acc >= (sock.buffer_capacity ÷ 256)
         aws_channel_slot_increment_read_window(sock.slot, acc)
         sock.accumulated_read_count = 0
     end
@@ -352,12 +352,8 @@ function Base.skip(sock::Client, n)
     return ret
 end
 
-Base.bytesavailable(sock::Client) = length(sock.readbuf)
-
-function Base.eof(sock::Client)
-    maybe_increment_read_window(sock, 0, "Base.eof")
-    eof(sock.readbuf)
-end
+Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
+Base.eof(sock::Client) = eof(sock.readbuf)
 
 Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
 
