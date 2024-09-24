@@ -322,7 +322,7 @@ function maybe_increment_read_window(sock::Client, nread, from)
     end
 end
 
-function Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer)
+function Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::UInt64)
     unsafe_read(sock.readbuf, ptr, n)
     maybe_increment_read_window(sock, n, "Base.unsafe_read")
     return
