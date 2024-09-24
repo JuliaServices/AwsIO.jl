@@ -28,6 +28,8 @@ function Base.setproperty!(x::StructRef{T}, k::Symbol, v::S) where {T, S}
     return v
 end
 
+const DEFAULT_READ_BUFFER_SIZE = 1 * 1024 * 1024  # 1MB
+
 mutable struct Client
     host::String
     port::Int
@@ -35,10 +37,16 @@ mutable struct Client
     tls::Bool
     socket_options::aws_socket_options
     tls_options::Union{aws_tls_connection_options, Nothing}
+    buffer_capacity::Int
     channel::Ptr{aws_channel}
     slot::Ptr{aws_channel_slot}
     ch::Channel{Symbol}
     readbuf::Base.BufferStream
+    # we use this atomic field to track how many bytes are available in the read buffer
+    # we need to access this from the c_process_read_message callback in order to adjust
+    # the read window appropriately; we also access it from any read functions on Client
+    # to determine if we need to increment the read window
+    @atomic readbuf_bytesavailable::Int
     writelock::ReentrantLock
     writebuf::IOBuffer
     bootstrap::aws_socket_channel_bootstrap_options
@@ -47,6 +55,7 @@ mutable struct Client
     function Client(host, port;
         allocator=default_aws_allocator(),
         client_bootstrap=default_aws_client_bootstrap(),
+        buffer_capacity::Int=DEFAULT_READ_BUFFER_SIZE,
         # socket options
         socket_options::Union{aws_socket_options, Nothing}=nothing,
         socket_type::aws_socket_type=AWS_SOCKET_STREAM,
@@ -93,24 +102,26 @@ mutable struct Client
                 ssl_alpn_list
             )
         end
-        x = new(host, port, debug, tls, socket_options, tls_options, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), ReentrantLock(), PipeBuffer())
-        x.bootstrap = aws_socket_channel_bootstrap_options(
-            client_bootstrap,
-            Base.unsafe_convert(Cstring, host),
-            port % UInt32,
-            pointer(FieldRef(x, :socket_options)),
-            tls_options !== nothing ? pointer(FieldRef(x, :tls_options)) : C_NULL,
-            C_NULL,
-            SETUP_CALLBACK[],
-            SHUTDOWN_CALLBACK[],
-            enable_read_back_pressure,
-            pointer_from_objref(x),
-            requested_event_loop,
-            host_resolution_override_config
-        )
-        aws_client_bootstrap_new_socket_channel(FieldRef(x, :bootstrap)) != 0 && throw(ClientError("failed to create socket"))
-        @assert take!(x.ch) == :setup "failed to create socket" # wait for connection
-        return x
+        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), 0, ReentrantLock(), PipeBuffer())
+        GC.@preserve x begin
+            x.bootstrap = aws_socket_channel_bootstrap_options(
+                client_bootstrap,
+                Base.unsafe_convert(Cstring, host),
+                port % UInt32,
+                pointer(FieldRef(x, :socket_options)),
+                tls_options !== nothing ? pointer(FieldRef(x, :tls_options)) : C_NULL,
+                C_NULL,
+                SETUP_CALLBACK[],
+                SHUTDOWN_CALLBACK[],
+                enable_read_back_pressure,
+                pointer_from_objref(x),
+                requested_event_loop,
+                host_resolution_override_config
+            )
+            aws_client_bootstrap_new_socket_channel(FieldRef(x, :bootstrap)) != 0 && throw(ClientError("failed to create socket"))
+            @assert take!(x.ch) == :setup "failed to create socket" # wait for connection
+            return x
+        end
     end
 end
 
@@ -118,41 +129,67 @@ function c_process_read_message(handler, slot, messageptr)::Cint
     msg = StructRef(messageptr)
     data = msg.message_data
     sock = unsafe_pointer_to_objref(handler.impl)
-    sock.debug && @info "c_process_read_message: $(data.len) bytes"
-    ret = AWS_OP_ERR
-    try
-        unsafe_write(sock.readbuf, data.buffer, data.len)
-        ret = AWS_OP_SUCCESS
-        aws_mem_release(msg.allocator, messageptr)
-    catch e
-        close(sock.ch, sockerr(e))
+    GC.@preserve sock begin
+        sock.debug && @info "c_process_read_message: $(data.len) bytes"
+        ret = AWS_OP_ERR
+        try
+            unsafe_write(sock.readbuf, data.buffer, data.len)
+            ret = AWS_OP_SUCCESS
+            aws_mem_release(msg.allocator, messageptr)
+            # update the atomic bytesavailable field
+            rb_ba = @atomic sock.readbuf_bytesavailable += data.len
+            if rb_ba >= sock.buffer_capacity
+                sock.debug && @info "Buffer is full; not incrementing read window"
+                # Do not increment the read window
+            else
+                # Continue reading by incrementing the read window
+                aws_channel_slot_increment_read_window(slot, data.len)
+            end
+        catch e
+            close(sock.ch, sockerr(e))
+        end
+        return ret
     end
-    return ret
 end
 
 function c_process_write_message(handler, slot, messageptr)::Cint
-    sock = unsafe_pointer_to_objref(handler.impl)
-    sock.debug && @info "c_process_write_message"
     # this should never be called since we only want to be the last slot in the channel
     return AWS_OP_ERR
 end
 
 function c_increment_read_window(handler, slot, size)::Cint
-    sock = unsafe_pointer_to_objref(handler.impl)
-    sock.debug && @info "c_increment_read_window"
     aws_channel_slot_increment_read_window(slot, size)
     return AWS_OP_SUCCESS
 end
 
 function c_shutdown(handler, slot, dir, error_code, free_scarce_resources_immediately)::Cint
     sock = unsafe_pointer_to_objref(handler.impl)
-    sock.debug && @warn "c_shutdown: dir = $dir"
-    close(sock.ch, sockerr(error_code))
+    GC.@preserve sock begin
+        close(sock.ch, sockerr(error_code))
+    end
     return aws_channel_slot_on_handler_shutdown_complete(slot, dir, error_code, free_scarce_resources_immediately)
 end
 
-function c_initial_window_size(channel_handler)::Csize_t
-    return typemax(Int64)
+function c_initial_window_size(handler)::Csize_t
+    sock = unsafe_pointer_to_objref(handler.impl)
+    GC.@preserve sock begin
+        # Return the buffer capacity as the initial window size
+        return sock.buffer_capacity
+    end
+end
+
+function maybe_increment_read_window(sock::Client)
+    # Check if the read window was previously stopped
+    if sock.read_window_stopped
+        # Calculate how much space is available in the buffer
+        available_space = sock.buffer_capacity - bytesavailable(sock.readbuf)
+        if available_space >= sock.min_read_increment
+            sock.debug && @info "Buffer has space; incrementing read window by $available_space bytes"
+            # Increment the read window
+            aws_channel_slot_increment_read_window(sock.slot, available_space)
+            sock.read_window_stopped = false
+        end
+    end
 end
 
 function c_message_overhead(channel_handler)::Csize_t
@@ -178,27 +215,29 @@ end
 const RW_HANDLER_VTABLE = Ref{aws_channel_handler_vtable}()
 
 function c_setup_callback(bootstrap, error_code, channel, socket)
-    if error_code != 0
-        socket.debug && @error "c_setup_callback: error = '$(unsafe_string(aws_error_str(error_code)))'"
-        close(socket.ch, sockerr(error_code))
-    else
-        slot = aws_channel_slot_new(channel)
-        if slot == C_NULL
-            socket.debug && @error "c_setup_callback: failed to create channel slot"
-            close(socket.ch, sockerr("failed to create channel slot"))
+    GC.@preserve socket begin
+        if error_code != 0
+            socket.debug && @error "c_setup_callback: error = '$(unsafe_string(aws_error_str(error_code)))'"
+            close(socket.ch, sockerr(error_code))
+        else
+            slot = aws_channel_slot_new(channel)
+            if slot == C_NULL
+                socket.debug && @error "c_setup_callback: failed to create channel slot"
+                close(socket.ch, sockerr("failed to create channel slot"))
+            end
+            if aws_channel_slot_insert_end(channel, slot) != 0
+                socket.debug && @error "c_setup_callback: failed to insert channel slot"
+                close(socket.ch, sockerr("failed to insert channel slot"))
+            end
+            socket.handler = aws_channel_handler(Base.unsafe_convert(Ptr{aws_channel_handler_vtable}, RW_HANDLER_VTABLE), default_aws_allocator(), C_NULL, pointer_from_objref(socket))
+            if aws_channel_slot_set_handler(slot, FieldRef(socket, :handler)) != 0
+                socket.debug && @error "c_setup_callback: failed to set channel slot handler"
+                close(socket.ch, sockerr("failed to set channel slot handler"))
+            end
+            socket.channel = channel
+            socket.slot = slot
+            put!(socket.ch, :setup)
         end
-        if aws_channel_slot_insert_end(channel, slot) != 0
-            socket.debug && @error "c_setup_callback: failed to insert channel slot"
-            close(socket.ch, sockerr("failed to insert channel slot"))
-        end
-        socket.handler = aws_channel_handler(Base.unsafe_convert(Ptr{aws_channel_handler_vtable}, RW_HANDLER_VTABLE), default_aws_allocator(), C_NULL, pointer_from_objref(socket))
-        if aws_channel_slot_set_handler(slot, FieldRef(socket, :handler)) != 0
-            socket.debug && @error "c_setup_callback: failed to set channel slot handler"
-            close(socket.ch, sockerr("failed to set channel slot handler"))
-        end
-        socket.channel = channel
-        socket.slot = slot
-        put!(socket.ch, :setup)
     end
     return
 end
@@ -206,12 +245,14 @@ end
 const SETUP_CALLBACK = Ref{Ptr{Cvoid}}(C_NULL)
 
 function c_shutdown_callback(bootstrap, error_code, channel, socket)
-    socket.debug && @warn "c_shutdown_callback"
-    close(socket.ch)
-    close(socket.readbuf)
-    close(socket.writebuf)
-    socket.channel = C_NULL
-    socket.slot = C_NULL
+    GC.@preserve socket begin
+        socket.debug && @warn "c_shutdown_callback"
+        close(socket.ch)
+        close(socket.readbuf)
+        close(socket.writebuf)
+        socket.channel = C_NULL
+        socket.slot = C_NULL
+    end
     return
 end
 
@@ -226,44 +267,49 @@ end
 function c_scheduled_write(channel_task, arg, status)
     try
         socket = arg.socket
-        if status == Int(AWS_TASK_STATUS_RUN_READY)
-            n = arg.n
-            socket.debug && @info "c_scheduled_write: writing $n bytes"
-            buf = aws_byte_buf(0, pointer(socket.writebuf.data), n, C_NULL)
-            bytes_written = 0
-            while bytes_written < n
-                msgptr = aws_channel_acquire_message_from_pool(socket.channel, AWS_IO_MESSAGE_APPLICATION_DATA, n - bytes_written)
-                if msgptr == C_NULL
-                    socket.debug && @error "c_scheduled_write: failed to acquire message from pool"
-                    close(socket.ch, sockerr("failed to acquire message from pool"))
-                    @goto done
+        GC.@preserve socket begin
+            if status == Int(AWS_TASK_STATUS_RUN_READY)
+                n = arg.n
+                socket.debug && @info "c_scheduled_write: writing $n bytes"
+                data = socket.writebuf.data
+                GC.@preserve data begin
+                    buf = aws_byte_buf(0, pointer(data), n, C_NULL)
+                    bytes_written = 0
+                    while bytes_written < n
+                        msgptr = aws_channel_acquire_message_from_pool(socket.channel, AWS_IO_MESSAGE_APPLICATION_DATA, n - bytes_written)
+                        if msgptr == C_NULL
+                            socket.debug && @error "c_scheduled_write: failed to acquire message from pool"
+                            close(socket.ch, sockerr("failed to acquire message from pool"))
+                            @goto done
+                        end
+                        msg = StructRef(msgptr)
+                        data = Ref(msg.message_data)
+                        cap = data[].capacity
+                        cursor = Ref(aws_byte_cursor(cap, buf.buffer + bytes_written))
+                        GC.@preserve data cursor begin
+                            aws_byte_buf_append(data, cursor)
+                            msg.message_data = data[]
+                        end
+                        socket.debug && @info "c_scheduled_write: sending $(data[].len) bytes in message"
+                        if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
+                            aws_mem_release(msg.allocator, msgptr)
+                            socket.debug && @error "c_scheduled_write: failed to send message"
+                            close(socket.ch, sockerr("failed to send message"))
+                            @goto done
+                        end
+                        bytes_written += cap
+                    end
+                    put!(socket.ch, :write_completed)
                 end
-                msg = StructRef(msgptr)
-                data = Ref(msg.message_data)
-                cap = data[].capacity
-                cursor = Ref(aws_byte_cursor(cap, buf.buffer + bytes_written))
-                GC.@preserve data cursor begin
-                    aws_byte_buf_append(data, cursor)
-                    msg.message_data = data[]
-                end
-                socket.debug && @info "c_scheduled_write: sending $(data[].len) bytes in message"
-                if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
-                    aws_mem_release(msg.allocator, msgptr)
-                    socket.debug && @error "c_scheduled_write: failed to send message"
-                    close(socket.ch, sockerr("failed to send message"))
-                    @goto done
-                end
-                bytes_written += cap
+            else
+                socket.debug && @warn "c_scheduled_write: task cancelled"
+                close(socket.ch, sockerr("task cancelled"))
             end
-            put!(socket.ch, :write_completed)
-        else
-            socket.debug && @warn "c_scheduled_write: task cancelled"
-            close(socket.ch, sockerr("task cancelled"))
         end
 @label done
     finally
         aws_mem_release(default_aws_allocator(), channel_task)
-        arg.socket.debug && @info "c_scheduled_write: write completed"
+        # arg.socket.debug && @info "c_scheduled_write: write completed"
     end
     return
 end
@@ -290,17 +336,66 @@ end
 
 Base.flush(sock::Client) = flush(sock.writebuf)
 
-Base.read(sock::Client) = read(sock.readbuf)
-Base.read!(sock::Client, buf::Vector{UInt8}) = read!(sock.readbuf, buf)
-Base.read(sock::Client, ::Type{T}) where {T} = read(sock.readbuf, T)
-Base.read(sock::Client, n::Integer) = read(sock.readbuf, n)
-Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer) = unsafe_read(sock.readbuf, ptr, n)
+function maybe_increment_read_window(sock::Client, bytes_available)
+    available_space = sock.buffer_capacity - bytes_available
+    if available_space >= (sock.buffer_capacity ÷ 32)
+        sock.debug && @info "Incrementing read window by $available_space bytes"
+        aws_channel_slot_increment_read_window(sock.slot, available_space)
+    end
+end
 
-Base.skip(sock::Client, n) = skip(sock.readbuf, n)
+function Base.read(sock::Client)
+    buf = read(sock.readbuf)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= length(buf)
+    maybe_increment_read_window(sock, rb_ba)
+    return buf
+end
+
+function Base.read!(sock::Client, buf::Vector{UInt8})
+    n = read!(sock.readbuf, buf)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= n
+    maybe_increment_read_window(sock, rb_ba)
+    return n
+end
+
+function Base.read(sock::Client, ::Type{T}) where {T}
+    x = read(sock.readbuf, T)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= sizeof(T)
+    maybe_increment_read_window(sock, rb_ba)
+    return x
+end
+
+function Base.read(sock::Client, n::Integer)
+    buf = read(sock.readbuf, n)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= length(buf)
+    maybe_increment_read_window(sock, rb_ba)
+    return buf
+end
+
+function Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer)
+    unsafe_read(sock.readbuf, ptr, n)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= n
+    maybe_increment_read_window(sock, rb_ba)
+    return
+end
+
+function Base.skip(sock::Client, n)
+    ret = skip(sock.readbuf, n)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= n
+    maybe_increment_read_window(sock, rb_ba)
+    return ret
+end
+
 Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
 Base.eof(sock::Client) = eof(sock.readbuf)
 Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
-Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, nb=length(buf)) = readbytes!(sock.readbuf, buf, nb)
+
+function Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, nb=length(buf))
+    act = readbytes!(sock.readbuf, buf, nb)
+    rb_ba = @atomic sock.readbuf_bytesavailable -= act
+    maybe_increment_read_window(sock, rb_ba)
+    return act
+end
 
 function Base.close(sock::Client)
     close(sock.ch)
@@ -315,11 +410,13 @@ function Base.close(sock::Client)
 end
 
 function c_on_negotiation_result(handler, slot, error_code, sock)
-    if error_code != 0
-        sock.debug && @error "c_on_negotiation_result: error = '$(unsafe_string(aws_error_str(error_code)))'"
-        close(sock.ch, sockerr(error_code))
-    else
-        put!(sock.ch, :negotiated)
+    GC.@preserve sock begin
+        if error_code != 0
+            sock.debug && @error "c_on_negotiation_result: error = '$(unsafe_string(aws_error_str(error_code)))'"
+            close(sock.ch, sockerr(error_code))
+        else
+            put!(sock.ch, :negotiated)
+        end
     end
     return
 end
@@ -327,40 +424,42 @@ end
 const ON_NEGOTIATION_RESULT = Ref{Ptr{Cvoid}}(C_NULL)
 
 function c_tls_upgrade(channel_task, arg, status)
-    if status == Int(AWS_TASK_STATUS_RUN_READY)
-        sock = arg.socket
-        tls_options = FieldRef(arg, :tls_options)
-        sock.debug && @info "c_tls_upgrade: initiating tls upgrade"
-        slot = aws_channel_slot_new(sock.channel)
-        if slot == C_NULL
-            close(sock.ch, sockerr("failed to create channel slot for tlsupgrade"))
+    sock = arg.socket
+    GC.@preserve sock begin
+        if status == Int(AWS_TASK_STATUS_RUN_READY)
+            tls_options = FieldRef(arg, :tls_options)
+            sock.debug && @info "c_tls_upgrade: initiating tls upgrade"
+            slot = aws_channel_slot_new(sock.channel)
+            if slot == C_NULL
+                close(sock.ch, sockerr("failed to create channel slot for tlsupgrade"))
+                @goto done
+            end
+            channel_handler = aws_tls_client_handler_new(default_aws_allocator(), tls_options, slot)
+            if channel_handler == C_NULL
+                close(sock.ch, sockerr("failed to create tls client handler"))
+                @goto done
+            end
+            if aws_channel_slot_insert_left(sock.slot, slot) != 0
+                close(sock.ch, sockerr("failed to insert channel slot for tlsupgrade"))
+                @goto done
+            end
+            if aws_channel_slot_set_handler(slot, channel_handler) != 0
+                close(sock.ch, sockerr("failed to set tls client handler"))
+                @goto done
+            end
+            if aws_tls_client_handler_start_negotiation(channel_handler) != 0
+                close(sock.ch, sockerr("failed to start tls negotiation"))
+                @goto done
+            end
+        else
+            sock.debug && @warn "c_tls_upgrade: task cancelled"
+            close(socket.ch, sockerr("task cancelled"))
             @goto done
         end
-        channel_handler = aws_tls_client_handler_new(default_aws_allocator(), tls_options, slot)
-        if channel_handler == C_NULL
-            close(sock.ch, sockerr("failed to create tls client handler"))
-            @goto done
-        end
-        if aws_channel_slot_insert_left(sock.slot, slot) != 0
-            close(sock.ch, sockerr("failed to insert channel slot for tlsupgrade"))
-            @goto done
-        end
-        if aws_channel_slot_set_handler(slot, channel_handler) != 0
-            close(sock.ch, sockerr("failed to set tls client handler"))
-            @goto done
-        end
-        if aws_tls_client_handler_start_negotiation(channel_handler) != 0
-            close(sock.ch, sockerr("failed to start tls negotiation"))
-            @goto done
-        end
-    else
-        sock.debug && @warn "c_tls_upgrade: task cancelled"
-        close(socket.ch, sockerr("task cancelled"))
-        @goto done
-    end
 @label done
-    aws_mem_release(default_aws_allocator(), channel_task)
-    sock.debug && @info "c_tls_upgrade: tls upgrade completed"
+        aws_mem_release(default_aws_allocator(), channel_task)
+        sock.debug && @info "c_tls_upgrade: tls upgrade completed"
+    end
     return
 end
 
