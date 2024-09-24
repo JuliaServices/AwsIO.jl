@@ -30,6 +30,7 @@ function __init__()
         C_NULL,
         C_NULL
     )
+    INCREMENT_READ_WINDOW_TASK[] = @cfunction(c_increment_read_window_task, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
     ON_NEGOTIATION_RESULT[] = @cfunction(c_on_negotiation_result, Cvoid, (Ptr{Cvoid}, Ptr{aws_channel_slot}, Cint, Any))
     TLS_UPGRADE[] = @cfunction(c_tls_upgrade, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
     return

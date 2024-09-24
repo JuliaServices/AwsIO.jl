@@ -1,3 +1,5 @@
+_id(obj) = string(objectid(obj); base=58)
+
 struct FieldRef{T, S}
     x::T
     field::Symbol
@@ -132,7 +134,7 @@ function c_process_read_message(handler, slot, messageptr)::Cint
             unsafe_write(sock.readbuf, data.buffer, data.len)
             ret = AWS_OP_SUCCESS
             aws_mem_release(msg.allocator, messageptr)
-            sock.debug && @info "c_process_read_message: $(data.len) bytes read, $(slotobj.window_size) window size, $(bytesavailable(sock.readbuf)) bytes available"
+            sock.debug && @info "[$(_id(sock))]: c_process_read_message: $(data.len) bytes read, $(slotobj.window_size) window size, $(bytesavailable(sock.readbuf)) bytes available"
         catch e
             close(sock.ch, sockerr(e))
         end
@@ -162,7 +164,7 @@ function c_initial_window_size(handler)::Csize_t
     sock = unsafe_pointer_to_objref(handler.impl)
     GC.@preserve sock begin
         # Return the buffer capacity as the initial window size
-        sock.debug && @info "c_initial_window_size: $(sock.buffer_capacity) bytes"
+        sock.debug && @info "[$(_id(sock))]: c_initial_window_size: $(sock.buffer_capacity) bytes"
         return sock.buffer_capacity
     end
 end
@@ -239,13 +241,39 @@ function schedule_channel_task(channel, task_fn, arg, type_tag)
     aws_channel_schedule_task_now(channel, ch_task)
 end
 
+mutable struct IncrementReadWindowArgs
+    socket::Client
+    increment::Int
+end
+
+function c_increment_read_window_task(channel_task, arg, status)
+    try
+        socket = arg.socket
+        GC.@preserve socket begin
+            if status == Int(AWS_TASK_STATUS_RUN_READY)
+                aws_channel_slot_increment_read_window(socket.slot, arg.increment)
+                put!(socket.ch, :read_window_incremented)
+                socket.debug && @info "[$(_id(socket))]: c_increment_read_window_task: incremented read window by $(arg.increment) bytes"
+            else
+                sock.debug && @warn "c_increment_read_window_task: task cancelled"
+                close(socket.ch, sockerr("task cancelled"))
+            end
+        end
+    finally
+        aws_mem_release(default_aws_allocator(), channel_task)
+    end
+    return
+end
+
+const INCREMENT_READ_WINDOW_TASK = Ref{Ptr{Cvoid}}()
+
 function c_scheduled_write(channel_task, arg, status)
     try
         socket = arg.socket
         GC.@preserve socket begin
             if status == Int(AWS_TASK_STATUS_RUN_READY)
                 n = arg.n
-                socket.debug && @info "c_scheduled_write: writing $n bytes"
+                socket.debug && @info "[$(_id(socket))]: c_scheduled_write: writing $n bytes"
                 writebufdata = socket.writebuf.data
                 GC.@preserve writebufdata begin
                     buf = aws_byte_buf(0, pointer(writebufdata), n, C_NULL)
@@ -265,7 +293,7 @@ function c_scheduled_write(channel_task, arg, status)
                             aws_byte_buf_append(data, cursor)
                             msg.message_data = data[]
                         end
-                        socket.debug && @info "c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:20]))..."
+                        socket.debug && @info "[$(_id(socket))]: c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:20]))..."
                         if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
                             aws_mem_release(msg.allocator, msgptr)
                             socket.debug && @error "c_scheduled_write: failed to send message"
@@ -284,7 +312,7 @@ function c_scheduled_write(channel_task, arg, status)
 @label done
     finally
         aws_mem_release(default_aws_allocator(), channel_task)
-        # arg.socket.debug && @info "c_scheduled_write: write completed"
+        # arg.socket.debug && @info #"[$(_id())]: c_scheduled_write: write completed"
     end
     return
 end
@@ -315,9 +343,13 @@ function maybe_increment_read_window(sock::Client, nread, from)
     acc = sock.accumulated_read_count += nread
     ba = bytesavailable(sock.readbuf)
     slotobj = unsafe_load(sock.slot)
-    sock.debug && @info "($(objectid(sock))), ($(from)): maybe_increment_read_window: $nread bytes just read, $ba bytes available, accumulated increment read count $acc, $(slotobj.window_size) window size"
+    sock.debug && @info "[$(_id(sock))]: ($(from)): maybe_increment_read_window: $nread bytes just read, $ba bytes available, accumulated increment read count $acc, $(slotobj.window_size) window size"
     if acc >= (sock.buffer_capacity ÷ 256)
-        aws_channel_slot_increment_read_window(sock.slot, acc)
+        arg = IncrementReadWindowArgs(sock, acc)
+        GC.@preserve arg begin
+            schedule_channel_task(sock.channel, INCREMENT_READ_WINDOW_TASK[], pointer_from_objref(arg), "socket channel increment read window")
+            take!(sock.ch) # wait for read window increment
+        end
         sock.accumulated_read_count = 0
     end
 end
@@ -388,7 +420,7 @@ function c_tls_upgrade(channel_task, arg, status)
     GC.@preserve sock begin
         if status == Int(AWS_TASK_STATUS_RUN_READY)
             tls_options = FieldRef(arg, :tls_options)
-            sock.debug && @info "c_tls_upgrade: initiating tls upgrade"
+            sock.debug && @info "[$(_id(sock))]: c_tls_upgrade: initiating tls upgrade"
             slot = aws_channel_slot_new(sock.channel)
             if slot == C_NULL
                 close(sock.ch, sockerr("failed to create channel slot for tlsupgrade"))
@@ -418,7 +450,7 @@ function c_tls_upgrade(channel_task, arg, status)
         end
 @label done
         aws_mem_release(default_aws_allocator(), channel_task)
-        sock.debug && @info "c_tls_upgrade: tls upgrade completed"
+        sock.debug && @info "[$(_id(sock))]: c_tls_upgrade: tls upgrade completed"
     end
     return
 end
