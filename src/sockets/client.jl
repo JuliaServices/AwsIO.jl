@@ -137,7 +137,7 @@ function c_process_read_message(handler, slot, messageptr)::Cint
             ret = AWS_OP_SUCCESS
             aws_mem_release(msg.allocator, messageptr)
             # update the atomic bytesavailable field
-            rb_ba = @atomic sock.readbuf_bytesavailable += data.len
+            rb_ba = @atomic sock.readbuf_bytesavailable += Int(data.len)
             if rb_ba >= sock.buffer_capacity
                 sock.debug && @info "Buffer is full; not incrementing read window"
                 # Do not increment the read window
