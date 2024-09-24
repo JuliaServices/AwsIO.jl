@@ -30,7 +30,7 @@ end
 
 const DEFAULT_READ_BUFFER_SIZE = 1 * 1024 * 1024  # 1MB
 
-mutable struct Client
+mutable struct Client <: IO
     host::String
     port::Int
     debug::Bool
@@ -41,7 +41,8 @@ mutable struct Client
     channel::Ptr{aws_channel}
     slot::Ptr{aws_channel_slot}
     ch::Channel{Symbol}
-    readbuf::Base.BufferStream
+    readbuf::BufferStream
+    accumulated_read_count::Int
     writelock::ReentrantLock
     writebuf::IOBuffer
     bootstrap::aws_socket_channel_bootstrap_options
@@ -97,7 +98,7 @@ mutable struct Client
                 ssl_alpn_list
             )
         end
-        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), ReentrantLock(), PipeBuffer())
+        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), BufferStream(), 0, ReentrantLock(), PipeBuffer())
         GC.@preserve x begin
             x.bootstrap = aws_socket_channel_bootstrap_options(
                 client_bootstrap,
@@ -245,9 +246,9 @@ function c_scheduled_write(channel_task, arg, status)
             if status == Int(AWS_TASK_STATUS_RUN_READY)
                 n = arg.n
                 socket.debug && @info "c_scheduled_write: writing $n bytes"
-                data = socket.writebuf.data
-                GC.@preserve data begin
-                    buf = aws_byte_buf(0, pointer(data), n, C_NULL)
+                writebufdata = socket.writebuf.data
+                GC.@preserve writebufdata begin
+                    buf = aws_byte_buf(0, pointer(writebufdata), n, C_NULL)
                     bytes_written = 0
                     while bytes_written < n
                         msgptr = aws_channel_acquire_message_from_pool(socket.channel, AWS_IO_MESSAGE_APPLICATION_DATA, n - bytes_written)
@@ -264,7 +265,7 @@ function c_scheduled_write(channel_task, arg, status)
                             aws_byte_buf_append(data, cursor)
                             msg.message_data = data[]
                         end
-                        socket.debug && @info "c_scheduled_write: sending $(data[].len) bytes in message"
+                        socket.debug && @info "c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:20]))..."
                         if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
                             aws_mem_release(msg.allocator, msgptr)
                             socket.debug && @error "c_scheduled_write: failed to send message"
@@ -295,81 +296,70 @@ mutable struct ScheduledWriteArgs
     n::Int
 end
 
-function Base.write(sock::Client, data)
+function Base.unsafe_write(sock::Client, ref::Ptr{UInt8}, nbytes::UInt)
     @lock sock.writelock begin
-        n = write(sock.writebuf, data)
-        args = ScheduledWriteArgs(sock, n)
+        Base.unsafe_write(sock.writebuf, ref, nbytes)
+        args = ScheduledWriteArgs(sock, nbytes)
         GC.@preserve args begin
             schedule_channel_task(sock.channel, SCHEDULED_WRITE[], pointer_from_objref(args), "socket channel write")
             take!(sock.ch) # wait for write completion
         end
-        skip(sock.writebuf, n) # "consume" the bytes we wrote to our writebuf to reset it for furture writes
-        return n
+        skip(sock.writebuf, nbytes) # "consume" the bytes we wrote to our writebuf to reset it for furture writes
+        return nbytes
     end
 end
 
 Base.flush(sock::Client) = flush(sock.writebuf)
 
-function maybe_increment_read_window(sock::Client, nread)
-    ba = bytesavailable(sock.readbuf)
+function maybe_increment_read_window(sock::Client, nread, from)
+    acc = sock.accumulated_read_count += nread
+    ba = length(sock.readbuf)
     slotobj = unsafe_load(sock.slot)
-    available_space = sock.buffer_capacity - slotobj.window_size
-    if available_space >= (sock.buffer_capacity ÷ 32)
-        sock.debug && @info "maybe_increment_read_window: $nread bytes just read, $ba bytes available, incrementing read window by $available_space, $(slotobj.window_size) window size"
-        aws_channel_slot_increment_read_window(sock.slot, available_space)
+    sock.debug && @info "($(objectid(sock))), ($(from)): maybe_increment_read_window: $nread bytes just read, $ba bytes available, accumulated increment read count $acc, $(slotobj.window_size) window size"
+    if acc >= 4096
+        aws_channel_slot_increment_read_window(sock.slot, acc)
+        sock.accumulated_read_count = 0
     end
-end
-
-function Base.read(sock::Client)
-    buf = read(sock.readbuf)
-    maybe_increment_read_window(sock, length(buf))
-    return buf
-end
-
-function Base.read!(sock::Client, buf::Vector{UInt8})
-    n = read!(sock.readbuf, buf)
-    maybe_increment_read_window(sock, n)
-    return n
-end
-
-function Base.read(sock::Client, ::Type{T}) where {T}
-    x = read(sock.readbuf, T)
-    maybe_increment_read_window(sock, sizeof(T))
-    return x
-end
-
-function Base.read(sock::Client, n::Integer)
-    buf = read(sock.readbuf, n)
-    maybe_increment_read_window(sock, length(buf))
-    return buf
 end
 
 function Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer)
     unsafe_read(sock.readbuf, ptr, n)
-    maybe_increment_read_window(sock, n)
+    maybe_increment_read_window(sock, n, "Base.unsafe_read")
     return
+end
+
+function Base.read(sock::Client, ::Type{UInt8})
+    ret = read(sock.readbuf, UInt8)
+    maybe_increment_read_window(sock, 1, "Base.read")
+    return ret
+end
+
+function Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, n::Integer=length(buf))
+    readbytes!(sock.readbuf, buf, n)
+    maybe_increment_read_window(sock, n, "Base.readbytes!")
+    return
+end
+
+function Base.read(sock::Client, n::Integer)
+    buf = read(sock.readbuf, n)
+    maybe_increment_read_window(sock, length(buf), "Base.read")
+    return buf
 end
 
 function Base.skip(sock::Client, n)
     ret = skip(sock.readbuf, n)
-    maybe_increment_read_window(sock, n)
+    maybe_increment_read_window(sock, n, "Base.skip")
     return ret
 end
 
-Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
+Base.bytesavailable(sock::Client) = length(sock.readbuf)
 
 function Base.eof(sock::Client)
-    maybe_increment_read_window(sock, 0)
+    maybe_increment_read_window(sock, 0, "Base.eof")
     eof(sock.readbuf)
 end
 
 Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
-
-function Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, nb=length(buf))
-    act = readbytes!(sock.readbuf, buf, nb)
-    maybe_increment_read_window(sock, act)
-    return act
-end
 
 function Base.close(sock::Client)
     close(sock.ch)
