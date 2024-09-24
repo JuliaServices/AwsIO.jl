@@ -21,7 +21,7 @@ data = String(read(sock, 100))
 close(sock)
 
 println("testing tls upgrade")
-sock = Sockets.Client("www.google.com", 443; tls=false, debug=true)
+sock = Sockets.Client("www.google.com", 443; tls=false, buffer_capacity=2^12, debug=true)
 AwsIO.Sockets.tlsupgrade!(sock; ssl_alpn_list="http/1.1")
 write(sock, "GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n")
 sleep(0.1)

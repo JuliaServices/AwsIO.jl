@@ -69,7 +69,7 @@ mutable struct Client
         ssl_cacert=nothing,
         ssl_insecure=false,
         ssl_alpn_list="h2;http/1.1",
-        enable_read_back_pressure::Bool=false,
+        enable_read_back_pressure::Bool=true,
         requested_event_loop=C_NULL,
         host_resolution_override_config=C_NULL,
         debug::Bool=false)
@@ -124,13 +124,14 @@ function c_process_read_message(handler, slot, messageptr)::Cint
     msg = StructRef(messageptr)
     data = msg.message_data
     sock = unsafe_pointer_to_objref(handler.impl)
+    slotobj = unsafe_load(slot)
     GC.@preserve sock begin
-        sock.debug && @info "c_process_read_message: $(data.len) bytes"
         ret = AWS_OP_ERR
         try
             unsafe_write(sock.readbuf, data.buffer, data.len)
             ret = AWS_OP_SUCCESS
             aws_mem_release(msg.allocator, messageptr)
+            sock.debug && @info "c_process_read_message: $(data.len) bytes read, $(slotobj.window_size) window size, $(bytesavailable(sock.readbuf)) bytes available"
         catch e
             close(sock.ch, sockerr(e))
         end
@@ -160,6 +161,7 @@ function c_initial_window_size(handler)::Csize_t
     sock = unsafe_pointer_to_objref(handler.impl)
     GC.@preserve sock begin
         # Return the buffer capacity as the initial window size
+        sock.debug && @info "c_initial_window_size: $(sock.buffer_capacity) bytes"
         return sock.buffer_capacity
     end
 end
@@ -308,47 +310,49 @@ end
 
 Base.flush(sock::Client) = flush(sock.writebuf)
 
-function maybe_increment_read_window(sock::Client, bytes_available)
-    available_space = sock.buffer_capacity - bytes_available
+function maybe_increment_read_window(sock::Client, nread)
+    ba = bytesavailable(sock.readbuf)
+    slotobj = unsafe_load(sock.slot)
+    available_space = sock.buffer_capacity - ba
     if available_space >= (sock.buffer_capacity ÷ 32)
-        sock.debug && @info "Incrementing read window by $available_space bytes"
+        sock.debug && @info "maybe_increment_read_window: $nread bytes just read, $ba bytes available, incrementing read window by $available_space, $(slotobj.window_size) window size"
         aws_channel_slot_increment_read_window(sock.slot, available_space)
     end
 end
 
 function Base.read(sock::Client)
     buf = read(sock.readbuf)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, length(buf))
     return buf
 end
 
 function Base.read!(sock::Client, buf::Vector{UInt8})
     n = read!(sock.readbuf, buf)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, n)
     return n
 end
 
 function Base.read(sock::Client, ::Type{T}) where {T}
     x = read(sock.readbuf, T)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, sizeof(T))
     return x
 end
 
 function Base.read(sock::Client, n::Integer)
     buf = read(sock.readbuf, n)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, length(buf))
     return buf
 end
 
 function Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::Integer)
     unsafe_read(sock.readbuf, ptr, n)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, n)
     return
 end
 
 function Base.skip(sock::Client, n)
     ret = skip(sock.readbuf, n)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, n)
     return ret
 end
 
@@ -358,7 +362,7 @@ Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws
 
 function Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, nb=length(buf))
     act = readbytes!(sock.readbuf, buf, nb)
-    maybe_increment_read_window(sock, bytesavailable(sock.readbuf))
+    maybe_increment_read_window(sock, act)
     return act
 end
 
