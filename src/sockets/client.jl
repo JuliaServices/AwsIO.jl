@@ -310,7 +310,7 @@ function c_scheduled_write(channel_task, arg, status)
                             aws_byte_buf_append(data, cursor)
                             msg.message_data = data[]
                         end
-                        socket.debug && @info "[$(_id(socket))]: c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:40]))..."
+                        socket.debug && @info "[$(_id(socket))]: c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:min(length(writebufdata), 40)]))..."
                         if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
                             aws_mem_release(msg.allocator, msgptr)
                             socket.debug && @error "c_scheduled_write: failed to send message"
