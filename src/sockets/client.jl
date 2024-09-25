@@ -30,7 +30,8 @@ function Base.setproperty!(x::StructRef{T}, k::Symbol, v::S) where {T, S}
     return v
 end
 
-const DEFAULT_READ_BUFFER_SIZE = 1 * 1024 * 1024  # 1MB
+# 256KB
+const DEFAULT_READ_BUFFER_SIZE = 256 * 1024
 
 mutable struct Client <: IO
     host::String
@@ -44,7 +45,9 @@ mutable struct Client <: IO
     slot::Ptr{aws_channel_slot}
     ch::Channel{Symbol}
     readbuf::Base.BufferStream
-    accumulated_read_count::Int
+    # keep track of our own window_size that corresponds to the channel slot.window_size (but it's more internal to aws-c-io)
+    # we want it to be equal to the amount of space left in our readbuf; buffer_capacity - bytesavailable(readbuf)
+    window_size::Int
     writelock::ReentrantLock
     writebuf::IOBuffer
     bootstrap::aws_socket_channel_bootstrap_options
@@ -100,7 +103,7 @@ mutable struct Client <: IO
                 ssl_alpn_list
             )
         end
-        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), 0, ReentrantLock(), PipeBuffer())
+        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), buffer_capacity, ReentrantLock(), PipeBuffer())
         GC.@preserve x begin
             x.bootstrap = aws_socket_channel_bootstrap_options(
                 client_bootstrap,
@@ -123,23 +126,64 @@ mutable struct Client <: IO
     end
 end
 
+mutable struct IncrementReadWindowArgs
+    socket::Client
+    increment::Int
+end
+
+function c_increment_read_window_task(channel_task, arg, status)
+    try
+        socket = arg.socket
+        if status == Int(AWS_TASK_STATUS_RUN_READY)
+            socket.window_size += arg.increment
+            slotobj = unsafe_load(socket.slot)
+            aws_channel_slot_increment_read_window(socket.slot, arg.increment)
+            put!(socket.ch, :read_window_incremented)
+            socket.debug && @info "[$(_id(socket))]: c_increment_read_window_task: incremented read window by $(arg.increment) bytes"
+        else
+            sock.debug && @warn "c_increment_read_window_task: task cancelled"
+            close(socket.ch, sockerr("task cancelled"))
+        end
+    finally
+        aws_mem_release(default_aws_allocator(), channel_task)
+    end
+    return
+end
+
+const INCREMENT_READ_WINDOW_TASK = Ref{Ptr{Cvoid}}()
+
+function check_increment_read_window!(socket::Client)
+    slotobj = unsafe_load(socket.slot)
+    # we want our window_size to be equal to the amount of space left in our readbuf
+    desired_size = socket.buffer_capacity - bytesavailable(socket.readbuf)
+    increment = desired_size - socket.window_size
+    socket.debug && @warn "[$(_id(socket))]: check_increment_read_window: socket.window_size = $(socket.window_size), slot.window_size = $(slotobj.window_size), bytesavailable = $(bytesavailable(socket.readbuf)), desired_size = $desired_size, increment = $increment"
+    if increment > 0
+        arg = IncrementReadWindowArgs(socket, increment)
+        GC.@preserve arg begin
+            schedule_channel_task(socket.channel, INCREMENT_READ_WINDOW_TASK[], pointer_from_objref(arg), "socket channel increment read window")
+            take!(socket.ch) # wait for read window increment
+        end
+    end
+    return
+end
+
 function c_process_read_message(handler, slot, messageptr)::Cint
     msg = StructRef(messageptr)
     data = msg.message_data
     sock = unsafe_pointer_to_objref(handler.impl)
     slotobj = unsafe_load(slot)
-    GC.@preserve sock begin
-        ret = AWS_OP_ERR
-        try
-            unsafe_write(sock.readbuf, data.buffer, data.len)
-            ret = AWS_OP_SUCCESS
-            aws_mem_release(msg.allocator, messageptr)
-            sock.debug && @info "[$(_id(sock))]: c_process_read_message: $(data.len) bytes read, $(slotobj.window_size) window size, $(bytesavailable(sock.readbuf)) bytes available"
-        catch e
-            close(sock.ch, sockerr(e))
-        end
-        return ret
+    ret = AWS_OP_ERR
+    try
+        unsafe_write(sock.readbuf, data.buffer, data.len)
+        ret = AWS_OP_SUCCESS
+        aws_mem_release(msg.allocator, messageptr)
+        sock.window_size -= Int(data.len)
+        sock.debug && @info "[$(_id(sock))]: c_process_read_message: read $(data.len) bytes, sock.window_size = $(sock.window_size), slot.window_size = $(slotobj.window_size)"
+    catch e
+        close(sock.ch, sockerr(e))
     end
+    return ret
 end
 
 function c_process_write_message(handler, slot, messageptr)::Cint
@@ -148,25 +192,24 @@ function c_process_write_message(handler, slot, messageptr)::Cint
 end
 
 function c_increment_read_window(handler, slot, size)::Cint
-    aws_channel_slot_increment_read_window(slot, size)
+    sock = unsafe_pointer_to_objref(handler.impl)
+    slotobj = unsafe_load(slot)
+    sock.debug && @info "[$(_id(sock))]: c_increment_read_window: size = $size, slot.window_size = $(slotobj.window_size), current_window_update_batch_size = $(slotobj.current_window_update_batch_size)"
+    # aws_channel_slot_increment_read_window(slot, size)
     return AWS_OP_SUCCESS
 end
 
 function c_shutdown(handler, slot, dir, error_code, free_scarce_resources_immediately)::Cint
     sock = unsafe_pointer_to_objref(handler.impl)
-    GC.@preserve sock begin
-        close(sock.ch, sockerr(error_code))
-    end
+    close(sock.ch, sockerr(error_code))
     return aws_channel_slot_on_handler_shutdown_complete(slot, dir, error_code, free_scarce_resources_immediately)
 end
 
 function c_initial_window_size(handler)::Csize_t
     sock = unsafe_pointer_to_objref(handler.impl)
-    GC.@preserve sock begin
-        # Return the buffer capacity as the initial window size
-        sock.debug && @info "[$(_id(sock))]: c_initial_window_size: $(sock.buffer_capacity) bytes"
-        return sock.buffer_capacity
-    end
+    # Return the buffer capacity as the initial window size
+    sock.debug && @info "[$(_id(sock))]: c_initial_window_size: $(sock.buffer_capacity) bytes"
+    return sock.buffer_capacity
 end
 
 function c_message_overhead(channel_handler)::Csize_t
@@ -241,32 +284,6 @@ function schedule_channel_task(channel, task_fn, arg, type_tag)
     aws_channel_schedule_task_now(channel, ch_task)
 end
 
-mutable struct IncrementReadWindowArgs
-    socket::Client
-    increment::Int
-end
-
-function c_increment_read_window_task(channel_task, arg, status)
-    try
-        socket = arg.socket
-        GC.@preserve socket begin
-            if status == Int(AWS_TASK_STATUS_RUN_READY)
-                aws_channel_slot_increment_read_window(socket.slot, arg.increment)
-                put!(socket.ch, :read_window_incremented)
-                socket.debug && @info "[$(_id(socket))]: c_increment_read_window_task: incremented read window by $(arg.increment) bytes"
-            else
-                sock.debug && @warn "c_increment_read_window_task: task cancelled"
-                close(socket.ch, sockerr("task cancelled"))
-            end
-        end
-    finally
-        aws_mem_release(default_aws_allocator(), channel_task)
-    end
-    return
-end
-
-const INCREMENT_READ_WINDOW_TASK = Ref{Ptr{Cvoid}}()
-
 function c_scheduled_write(channel_task, arg, status)
     try
         socket = arg.socket
@@ -293,7 +310,7 @@ function c_scheduled_write(channel_task, arg, status)
                             aws_byte_buf_append(data, cursor)
                             msg.message_data = data[]
                         end
-                        socket.debug && @info "[$(_id(socket))]: c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:20]))..."
+                        socket.debug && @info "[$(_id(socket))]: c_scheduled_write: sending $(data[].len) bytes in message: $(String(writebufdata[1:40]))..."
                         if aws_channel_slot_send_message(socket.slot, msgptr, AWS_CHANNEL_DIR_WRITE) != 0
                             aws_mem_release(msg.allocator, msgptr)
                             socket.debug && @error "c_scheduled_write: failed to send message"
@@ -339,48 +356,33 @@ end
 
 Base.flush(sock::Client) = flush(sock.writebuf)
 
-function maybe_increment_read_window(sock::Client, nread, from)
-    acc = sock.accumulated_read_count += nread
-    ba = bytesavailable(sock.readbuf)
-    slotobj = unsafe_load(sock.slot)
-    sock.debug && @info "[$(_id(sock))]: ($(from)): maybe_increment_read_window: $nread bytes just read, $ba bytes available, accumulated increment read count $acc, $(slotobj.window_size) window size"
-    if acc >= (sock.buffer_capacity ÷ 256)
-        arg = IncrementReadWindowArgs(sock, acc)
-        GC.@preserve arg begin
-            schedule_channel_task(sock.channel, INCREMENT_READ_WINDOW_TASK[], pointer_from_objref(arg), "socket channel increment read window")
-            take!(sock.ch) # wait for read window increment
-        end
-        sock.accumulated_read_count = 0
-    end
-end
-
 function Base.unsafe_read(sock::Client, ptr::Ptr{UInt8}, n::UInt64)
     unsafe_read(sock.readbuf, ptr, n)
-    maybe_increment_read_window(sock, n, "Base.unsafe_read")
+    check_increment_read_window!(sock)
     return
 end
 
 function Base.read(sock::Client, ::Type{UInt8})
     ret = read(sock.readbuf, UInt8)
-    maybe_increment_read_window(sock, 1, "Base.read")
+    check_increment_read_window!(sock)
     return ret
 end
 
 function Base.readbytes!(sock::Client, buf::AbstractVector{UInt8}, n::Integer=length(buf))
     readbytes!(sock.readbuf, buf, n)
-    maybe_increment_read_window(sock, n, "Base.readbytes!")
+    check_increment_read_window!(sock)
     return n
 end
 
 function Base.read(sock::Client, n::Integer)
     buf = read(sock.readbuf, n)
-    maybe_increment_read_window(sock, length(buf), "Base.read")
+    check_increment_read_window!(sock)
     return buf
 end
 
 function Base.skip(sock::Client, n)
     ret = skip(sock.readbuf, n)
-    maybe_increment_read_window(sock, n, "Base.skip")
+    check_increment_read_window!(sock)
     return ret
 end
 

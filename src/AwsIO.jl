@@ -14,7 +14,25 @@ sockerr(e::Exception) = CapturedException(e, Base.backtrace())
 
 include("sockets/client.jl")
 
+const LOGGER_FILE_REF = Ref{Libc.FILE}()
+const LOGGER_OPTIONS = Ref{aws_logger_standard_options}()
+const LOGGER = Ref{Ptr{Cvoid}}(C_NULL)
+
+#NOTE: this is global process logging in the aws-crt libraries; not appropriate for request-level
+# logging, but more for debugging the library itself
+function set_log_level!(level::Integer)
+    @assert 0 <= level <= 7 "log level must be between 0 and 7"
+    @assert aws_logger_set_log_level(LOGGER[], aws_log_level(level)) == 0
+    return
+end
+
 function __init__()
+    allocator = default_aws_allocator()
+    LOGGER[] = aws_mem_acquire(allocator, 64)
+    LOGGER_FILE_REF[] = Libc.FILE(Libc.RawFD(1), "w")
+    LOGGER_OPTIONS[] = aws_logger_standard_options(aws_log_level(3), C_NULL, Ptr{Libc.FILE}(LOGGER_FILE_REF[].ptr))
+    @assert aws_logger_init_standard(LOGGER[], allocator, LOGGER_OPTIONS) == 0
+    aws_logger_set(LOGGER[])
     SETUP_CALLBACK[] = @cfunction(c_setup_callback, Cvoid, (Ptr{aws_client_bootstrap}, Cint, Ptr{aws_channel}, Any))
     SHUTDOWN_CALLBACK[] = @cfunction(c_shutdown_callback, Cvoid, (Ptr{aws_client_bootstrap}, Cint, Ptr{aws_channel}, Any))
     SCHEDULED_WRITE[] = @cfunction(c_scheduled_write, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
