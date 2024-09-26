@@ -144,6 +144,8 @@ function c_increment_read_window_task(channel_task, arg, status)
             sock.debug && @warn "c_increment_read_window_task: task cancelled"
             close(socket.ch, sockerr("task cancelled"))
         end
+    catch e
+        close(socket.ch, sockerr(e))
     finally
         aws_mem_release(default_aws_allocator(), channel_task)
     end
