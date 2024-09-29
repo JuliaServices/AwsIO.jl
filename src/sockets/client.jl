@@ -121,6 +121,7 @@ mutable struct Client <: IO
             )
             aws_client_bootstrap_new_socket_channel(FieldRef(x, :bootstrap)) != 0 && throw(ClientError("failed to create socket"))
             @assert take!(x.ch) == :setup "failed to create socket" # wait for connection
+            finalizer(close, x)
             return x
         end
     end
