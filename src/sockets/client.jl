@@ -75,7 +75,7 @@ mutable struct Client <: IO
         ssl_cacert=nothing,
         ssl_insecure=false,
         ssl_alpn_list="h2;http/1.1",
-        enable_read_back_pressure::Bool=true,
+        enable_read_back_pressure::Bool=false,
         requested_event_loop=C_NULL,
         host_resolution_override_config=C_NULL,
         debug::Bool=false)
