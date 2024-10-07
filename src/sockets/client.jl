@@ -138,6 +138,7 @@ function c_increment_read_window_task(channel_task, arg, status)
         if status == Int(AWS_TASK_STATUS_RUN_READY)
             socket.window_size += arg.increment
             slotobj = unsafe_load(socket.slot)
+            # TODO: check return value of aws_channel_slot_increment_read_window
             aws_channel_slot_increment_read_window(socket.slot, arg.increment)
             put!(socket.ch, :read_window_incremented)
             socket.debug && @info "[$(_id(socket))]: c_increment_read_window_task: incremented read window by $(arg.increment) bytes"
@@ -268,14 +269,13 @@ end
 const SETUP_CALLBACK = Ref{Ptr{Cvoid}}(C_NULL)
 
 function c_shutdown_callback(bootstrap, error_code, channel, socket)
-    GC.@preserve socket begin
-        socket.debug && @warn "c_shutdown_callback"
-        close(socket.ch)
-        close(socket.readbuf)
-        close(socket.writebuf)
-        socket.channel = C_NULL
-        socket.slot = C_NULL
-    end
+    socket.debug && @warn "c_shutdown_callback"
+    close(socket.ch)
+    close(socket.readbuf)
+    close(socket.writebuf)
+    socket.channel = C_NULL
+    socket.slot = C_NULL
+    aws_channel_destroy(channel)
     return
 end
 
