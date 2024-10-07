@@ -40,6 +40,7 @@ mutable struct Client <: IO
     tls::Bool
     socket_options::aws_socket_options
     tls_options::Union{aws_tls_connection_options, Nothing}
+    tls_handler::Ptr{aws_channel_handler} # only used in tlsupgrade!
     buffer_capacity::Int
     channel::Ptr{aws_channel}
     slot::Ptr{aws_channel_slot}
@@ -103,7 +104,7 @@ mutable struct Client <: IO
                 ssl_alpn_list
             )
         end
-        x = new(host, port, debug, tls, socket_options, tls_options, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), buffer_capacity, ReentrantLock(), PipeBuffer())
+        x = new(host, port, debug, tls, socket_options, tls_options, C_NULL, buffer_capacity, C_NULL, C_NULL, Channel{Symbol}(0), Base.BufferStream(), buffer_capacity, ReentrantLock(), PipeBuffer())
         GC.@preserve x begin
             x.bootstrap = aws_socket_channel_bootstrap_options(
                 client_bootstrap,
@@ -239,29 +240,32 @@ end
 const RW_HANDLER_VTABLE = Ref{aws_channel_handler_vtable}()
 
 function c_setup_callback(bootstrap, error_code, channel, socket)
-    GC.@preserve socket begin
-        if error_code != 0
-            socket.debug && @error "c_setup_callback: error = '$(unsafe_string(aws_error_str(error_code)))'"
-            close(socket.ch, sockerr(error_code))
-        else
-            slot = aws_channel_slot_new(channel)
-            if slot == C_NULL
-                socket.debug && @error "c_setup_callback: failed to create channel slot"
-                close(socket.ch, sockerr("failed to create channel slot"))
-            end
-            if aws_channel_slot_insert_end(channel, slot) != 0
-                socket.debug && @error "c_setup_callback: failed to insert channel slot"
-                close(socket.ch, sockerr("failed to insert channel slot"))
-            end
-            socket.handler = aws_channel_handler(Base.unsafe_convert(Ptr{aws_channel_handler_vtable}, RW_HANDLER_VTABLE), default_aws_allocator(), C_NULL, pointer_from_objref(socket))
-            if aws_channel_slot_set_handler(slot, FieldRef(socket, :handler)) != 0
-                socket.debug && @error "c_setup_callback: failed to set channel slot handler"
-                close(socket.ch, sockerr("failed to set channel slot handler"))
-            end
-            socket.channel = channel
-            socket.slot = slot
-            put!(socket.ch, :setup)
+    if error_code != 0
+        socket.debug && @error "c_setup_callback: error = '$(unsafe_string(aws_error_str(error_code)))'"
+        close(socket.ch, sockerr(error_code))
+    else
+        slot = aws_channel_slot_new(channel)
+        if slot == C_NULL
+            socket.debug && @error "c_setup_callback: failed to create channel slot"
+            close(socket.ch, sockerr("failed to create channel slot"))
+            return
         end
+        if aws_channel_slot_insert_end(channel, slot) != 0
+            aws_channel_slot_remove(slot)
+            socket.debug && @error "c_setup_callback: failed to insert channel slot"
+            close(socket.ch, sockerr("failed to insert channel slot"))
+            return
+        end
+        socket.handler = aws_channel_handler(Base.unsafe_convert(Ptr{aws_channel_handler_vtable}, RW_HANDLER_VTABLE), default_aws_allocator(), C_NULL, pointer_from_objref(socket))
+        if aws_channel_slot_set_handler(slot, FieldRef(socket, :handler)) != 0
+            aws_channel_slot_remove(slot)
+            socket.debug && @error "c_setup_callback: failed to set channel slot handler"
+            close(socket.ch, sockerr("failed to set channel slot handler"))
+            return
+        end
+        socket.channel = channel
+        socket.slot = slot
+        put!(socket.ch, :setup)
     end
     return
 end
@@ -276,6 +280,10 @@ function c_shutdown_callback(bootstrap, error_code, channel, socket)
     socket.channel = C_NULL
     socket.slot = C_NULL
     aws_channel_destroy(channel)
+    # if socket.tls_handler != C_NULL
+    #     aws_channel_handler_destroy(socket.tls_handler)
+    #     socket.tls_handler = C_NULL
+    # end
     return
 end
 
@@ -300,11 +308,6 @@ function c_scheduled_write(channel_task, arg, status)
                     bytes_written = 0
                     while bytes_written < n
                         msgptr = aws_channel_acquire_message_from_pool(socket.channel, AWS_IO_MESSAGE_APPLICATION_DATA, n - bytes_written)
-                        if msgptr == C_NULL
-                            socket.debug && @error "c_scheduled_write: failed to acquire message from pool"
-                            close(socket.ch, sockerr("failed to acquire message from pool"))
-                            @goto done
-                        end
                         msg = StructRef(msgptr)
                         data = Ref(msg.message_data)
                         cap = data[].capacity
@@ -402,6 +405,13 @@ function Base.close(sock::Client)
         aws_channel_shutdown(sock.channel, 0)
         sock.channel = C_NULL
     end
+    if sock.tls_options !== nothing
+        ref = Ref(sock.tls_options)
+        GC.@preserve ref begin
+            aws_tls_connection_options_clean_up(ref)
+        end
+        sock.tls_options = nothing
+    end
     sock.slot = C_NULL
     return
 end
@@ -422,41 +432,41 @@ const ON_NEGOTIATION_RESULT = Ref{Ptr{Cvoid}}(C_NULL)
 
 function c_tls_upgrade(channel_task, arg, status)
     sock = arg.socket
-    GC.@preserve sock begin
-        if status == Int(AWS_TASK_STATUS_RUN_READY)
-            tls_options = FieldRef(arg, :tls_options)
-            sock.debug && @info "[$(_id(sock))]: c_tls_upgrade: initiating tls upgrade"
-            slot = aws_channel_slot_new(sock.channel)
-            if slot == C_NULL
-                close(sock.ch, sockerr("failed to create channel slot for tlsupgrade"))
-                @goto done
-            end
-            channel_handler = aws_tls_client_handler_new(default_aws_allocator(), tls_options, slot)
-            if channel_handler == C_NULL
-                close(sock.ch, sockerr("failed to create tls client handler"))
-                @goto done
-            end
-            if aws_channel_slot_insert_left(sock.slot, slot) != 0
-                close(sock.ch, sockerr("failed to insert channel slot for tlsupgrade"))
-                @goto done
-            end
-            if aws_channel_slot_set_handler(slot, channel_handler) != 0
-                close(sock.ch, sockerr("failed to set tls client handler"))
-                @goto done
-            end
-            if aws_tls_client_handler_start_negotiation(channel_handler) != 0
-                close(sock.ch, sockerr("failed to start tls negotiation"))
-                @goto done
-            end
-        else
-            sock.debug && @warn "c_tls_upgrade: task cancelled"
-            close(socket.ch, sockerr("task cancelled"))
+    if status == Int(AWS_TASK_STATUS_RUN_READY)
+        tls_options = FieldRef(arg, :tls_options)
+        sock.debug && @info "[$(_id(sock))]: c_tls_upgrade: initiating tls upgrade"
+        slot = aws_channel_slot_new(sock.channel)
+        if slot == C_NULL
+            close(sock.ch, sockerr("failed to create channel slot for tlsupgrade"))
             @goto done
         end
-@label done
-        aws_mem_release(default_aws_allocator(), channel_task)
-        sock.debug && @info "[$(_id(sock))]: c_tls_upgrade: tls upgrade completed"
+        channel_handler = aws_tls_client_handler_new(default_aws_allocator(), tls_options, slot)
+        if channel_handler == C_NULL
+            close(sock.ch, sockerr("failed to create tls client handler"))
+            @goto done
+        end
+        sock.tls_handler = channel_handler
+        if aws_channel_slot_insert_left(sock.slot, slot) != 0
+            close(sock.ch, sockerr("failed to insert channel slot for tlsupgrade"))
+            @goto done
+        end
+        if aws_channel_slot_set_handler(slot, channel_handler) != 0
+            close(sock.ch, sockerr("failed to set tls client handler"))
+            @goto done
+        end
+        if aws_tls_client_handler_start_negotiation(channel_handler) != 0
+            close(sock.ch, sockerr("failed to start tls negotiation"))
+            @goto done
+        end
+        sock.tls_options = arg.tls_options
+    else
+        sock.debug && @warn "c_tls_upgrade: task cancelled"
+        close(socket.ch, sockerr("task cancelled"))
+        @goto done
     end
+@label done
+    aws_mem_release(default_aws_allocator(), channel_task)
+    sock.debug && @info "[$(_id(sock))]: c_tls_upgrade: tls upgrade completed"
     return
 end
 

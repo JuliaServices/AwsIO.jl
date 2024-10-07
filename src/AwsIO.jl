@@ -26,6 +26,15 @@ function set_log_level!(level::Integer)
     return
 end
 
+function trace_memory!()
+    LibAwsCommon.set_default_aws_allocator!(LibAwsCommon.mem_trace_allocator())
+    return
+end
+
+function trace_memory_dump()
+    aws_mem_tracer_dump(LibAwsCommon.default_aws_allocator())
+end
+
 function __init__()
     allocator = default_aws_allocator()
     LOGGER[] = aws_mem_acquire(allocator, 64)
