@@ -26,8 +26,9 @@ function set_log_level!(level::Integer)
     return
 end
 
-function trace_memory!()
-    LibAwsCommon.set_default_aws_allocator!(LibAwsCommon.mem_trace_allocator())
+# AWS_MEMTRACE_STACKS
+function trace_memory!(mem_trace_level=AWS_MEMTRACE_BYTES)
+    LibAwsCommon.set_default_aws_allocator!(LibAwsCommon.mem_trace_allocator(default_aws_allocator(), mem_trace_level))
     return
 end
 

@@ -265,7 +265,11 @@ function c_setup_callback(bootstrap, error_code, channel, socket)
         end
         socket.channel = channel
         socket.slot = slot
-        put!(socket.ch, :setup)
+        try
+            put!(socket.ch, :setup)
+        catch e
+            close(socket.ch, sockerr(e))
+        end
     end
     return
 end
@@ -280,10 +284,6 @@ function c_shutdown_callback(bootstrap, error_code, channel, socket)
     socket.channel = C_NULL
     socket.slot = C_NULL
     aws_channel_destroy(channel)
-    # if socket.tls_handler != C_NULL
-    #     aws_channel_handler_destroy(socket.tls_handler)
-    #     socket.tls_handler = C_NULL
-    # end
     return
 end
 
@@ -325,7 +325,11 @@ function c_scheduled_write(channel_task, arg, status)
                         end
                         bytes_written += cap
                     end
-                    put!(socket.ch, :write_completed)
+                    try
+                        put!(socket.ch, :write_completed)
+                    catch e
+                        close(socket.ch, sockerr(e))
+                    end
                 end
             else
                 socket.debug && @warn "c_scheduled_write: task cancelled"
@@ -422,7 +426,11 @@ function c_on_negotiation_result(handler, slot, error_code, sock)
             sock.debug && @error "c_on_negotiation_result: error = '$(unsafe_string(aws_error_str(error_code)))'"
             close(sock.ch, sockerr(error_code))
         else
-            put!(sock.ch, :negotiated)
+            try
+                put!(sock.ch, :negotiated)
+            catch e
+                close(sock.ch, sockerr(e))
+            end
         end
     end
     return
