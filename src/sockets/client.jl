@@ -283,7 +283,6 @@ function c_shutdown_callback(bootstrap, error_code, channel, socket)
     close(socket.writebuf)
     socket.channel = C_NULL
     socket.slot = C_NULL
-    aws_channel_destroy(channel)
     return
 end
 
