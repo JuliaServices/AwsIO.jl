@@ -32,9 +32,9 @@ function trace_memory!(mem_trace_level=AWS_MEMTRACE_BYTES)
     return
 end
 
-function trace_memory_dump()
-    aws_mem_tracer_dump(LibAwsCommon.default_aws_allocator())
-end
+trace_memory_dump() = aws_mem_tracer_dump(LibAwsCommon.default_aws_allocator())
+trace_memory_bytes() = aws_mem_tracer_bytes(LibAwsCommon.default_aws_allocator())
+trace_memory_count() = aws_mem_tracer_count(LibAwsCommon.default_aws_allocator())
 
 function __init__()
     allocator = default_aws_allocator()
