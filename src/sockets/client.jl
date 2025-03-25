@@ -86,6 +86,7 @@ mutable struct Client <: IO
             socket_options = aws_socket_options(
                 socket_type,
                 socket_domain,
+                AWS_SOCKET_IMPL_PLATFORM_DEFAULT, # aws_socket_impl_type
                 connect_timeout_ms,
                 keep_alive_interval_sec,
                 keep_alive_timeout_sec,
