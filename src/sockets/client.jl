@@ -399,7 +399,12 @@ end
 Base.bytesavailable(sock::Client) = bytesavailable(sock.readbuf)
 Base.eof(sock::Client) = eof(sock.readbuf)
 
-Base.isopen(sock::Client) = sock.slot == C_NULL ? false : aws_socket_is_open(aws_socket_handler_get_socket(FieldRef(sock, :handler)))
+function Base.isopen(sock::Client)
+    sock.slot == C_NULL && return false
+    socket_slot = aws_channel_get_first_slot(sock.channel)
+    socket_ptr = aws_socket_handler_get_socket(unsafe_load(socket_slot).handler)
+    return aws_socket_is_open(socket_ptr)
+end
 
 function Base.close(sock::Client)
     close(sock.ch)

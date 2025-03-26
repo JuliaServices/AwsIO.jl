@@ -32,3 +32,5 @@ socket = AwsIO.Sockets.Client(host, port)
 # connect a socket with TLS encryption to `host` on `port`
 tls = AwsIO.Sockets.Client(host, port; tls=true)
 ```
+
+Otherwise, the returned `AwsIO.Sockets.Client` object behaves like a standard `IO` object.
