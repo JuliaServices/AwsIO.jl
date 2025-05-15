@@ -43,9 +43,9 @@ function __init__()
     LOGGER_OPTIONS[] = aws_logger_standard_options(aws_log_level(3), C_NULL, Ptr{Libc.FILE}(LOGGER_FILE_REF[].ptr))
     @assert aws_logger_init_standard(LOGGER[], allocator, LOGGER_OPTIONS) == 0
     aws_logger_set(LOGGER[])
-    SETUP_CALLBACK[] = @cfunction(c_setup_callback, Cvoid, (Ptr{aws_client_bootstrap}, Cint, Ptr{aws_channel}, Any))
-    SHUTDOWN_CALLBACK[] = @cfunction(c_shutdown_callback, Cvoid, (Ptr{aws_client_bootstrap}, Cint, Ptr{aws_channel}, Any))
-    SCHEDULED_WRITE[] = @cfunction(c_scheduled_write, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
+    SETUP_CALLBACK[] = @cfunction(c_setup_callback, Cvoid, (Ptr{aws_client_bootstrap}, Cint, Ptr{aws_channel}, Ptr{Cvoid}))
+    SHUTDOWN_CALLBACK[] = @cfunction(c_shutdown_callback, Cvoid, (Ptr{aws_client_bootstrap}, Cint, Ptr{aws_channel}, Ptr{Cvoid}))
+    SCHEDULED_WRITE[] = @cfunction(c_scheduled_write, Cvoid, (Ptr{aws_channel_task}, Ptr{Cvoid}, Cint))
     RW_HANDLER_VTABLE[] = aws_channel_handler_vtable(
         @cfunction(c_process_read_message, Cint, (Ref{aws_channel_handler}, Ptr{aws_channel_slot}, Ptr{aws_io_message})),
         @cfunction(c_process_write_message, Cint, (Ref{aws_channel_handler}, Ptr{aws_channel_slot}, Ptr{aws_io_message})),
@@ -58,9 +58,9 @@ function __init__()
         C_NULL,
         C_NULL
     )
-    INCREMENT_READ_WINDOW_TASK[] = @cfunction(c_increment_read_window_task, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
-    ON_NEGOTIATION_RESULT[] = @cfunction(c_on_negotiation_result, Cvoid, (Ptr{Cvoid}, Ptr{aws_channel_slot}, Cint, Any))
-    TLS_UPGRADE[] = @cfunction(c_tls_upgrade, Cvoid, (Ptr{aws_channel_task}, Any, Cint))
+    INCREMENT_READ_WINDOW_TASK[] = @cfunction(c_increment_read_window_task, Cvoid, (Ptr{aws_channel_task}, Ptr{Cvoid}, Cint))
+    ON_NEGOTIATION_RESULT[] = @cfunction(c_on_negotiation_result, Cvoid, (Ptr{Cvoid}, Ptr{aws_channel_slot}, Cint, Ptr{Cvoid}))
+    TLS_UPGRADE[] = @cfunction(c_tls_upgrade, Cvoid, (Ptr{aws_channel_task}, Ptr{Cvoid}, Cint))
     return
 end
 

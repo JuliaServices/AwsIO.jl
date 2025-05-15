@@ -1,6 +1,6 @@
 name = "AwsIO"
 uuid = "4047365c-aa37-44ec-b1fa-4c0d5495ccf1"
-version = "1.0.0"
+version = "1.0.1"
 
 [deps]
 LibAwsCommon = "c6e421ba-b5f8-4792-a1c4-42948de3ed9d"
