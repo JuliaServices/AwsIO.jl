@@ -117,14 +117,18 @@ function c_increment_read_window_task(channel_task, arg_ptr, status)
     try
         socket = arg.socket
         if status == Int(AWS_TASK_STATUS_RUN_READY)
-            socket.window_size += arg.increment
-            slotobj = unsafe_load(socket.slot)
-            # TODO: check return value of aws_channel_slot_increment_read_window
-            aws_channel_slot_increment_read_window(socket.slot, arg.increment)
-            notify(arg.future)
-            socket.debug && @info "[$(_id(socket))]: c_increment_read_window_task: incremented read window by $(arg.increment) bytes"
+            if socket.channel == C_NULL || socket.slot == C_NULL
+                socket.debug && @warn "[$(_id(socket))]: c_increment_read_window_task: channel/slot closed; skipping"
+                notify(arg.future, sockerr("channel closed"))
+            else
+                socket.window_size += arg.increment
+                # TODO: check return value of aws_channel_slot_increment_read_window
+                aws_channel_slot_increment_read_window(socket.slot, arg.increment)
+                notify(arg.future)
+                socket.debug && @info "[$(_id(socket))]: c_increment_read_window_task: incremented read window by $(arg.increment) bytes"
+            end
         else
-            sock.debug && @warn "c_increment_read_window_task: task cancelled"
+            socket.debug && @warn "c_increment_read_window_task: task cancelled"
             notify(arg.future, sockerr("task cancelled"))
         end
     catch e
@@ -138,16 +142,22 @@ end
 const INCREMENT_READ_WINDOW_TASK = Ref{Ptr{Cvoid}}()
 
 function check_increment_read_window!(socket::Client)
-    slotobj = unsafe_load(socket.slot)
+    # Channel or slot may be cleared during shutdown; avoid dereferencing null pointers
+    if socket.channel == C_NULL || socket.slot == C_NULL
+        return
+    end
     # we want our window_size to be equal to the amount of space left in our readbuf
     desired_size = socket.buffer_capacity - bytesavailable(socket.readbuf)
     increment = desired_size - socket.window_size
-    socket.debug && @warn "[$(_id(socket))]: check_increment_read_window: socket.window_size = $(socket.window_size), slot.window_size = $(slotobj.window_size), bytesavailable = $(bytesavailable(socket.readbuf)), desired_size = $desired_size, increment = $increment"
+    socket.debug && @warn "[$(_id(socket))]: check_increment_read_window: socket.window_size = $(socket.window_size), bytesavailable = $(bytesavailable(socket.readbuf)), desired_size = $desired_size, increment = $increment"
     if increment > 0
-        arg = IncrementReadWindowArgs(socket, increment, Future())
-        GC.@preserve arg begin
-            schedule_channel_task(socket.channel, INCREMENT_READ_WINDOW_TASK[], pointer_from_objref(arg), "socket channel increment read window")
-            wait(arg.future) # wait for read window increment
+        # Re-check before scheduling, since channel/slot may have been closed between computations
+        if socket.channel != C_NULL && socket.slot != C_NULL
+            arg = IncrementReadWindowArgs(socket, increment, Future())
+            GC.@preserve arg begin
+                schedule_channel_task(socket.channel, INCREMENT_READ_WINDOW_TASK[], pointer_from_objref(arg), "socket channel increment read window")
+                wait(arg.future) # wait for read window increment
+            end
         end
     end
     return
@@ -275,6 +285,11 @@ function c_scheduled_write(channel_task, arg_ptr, status)
         socket = arg.socket
         GC.@preserve socket begin
             if status == Int(AWS_TASK_STATUS_RUN_READY)
+                if socket.channel == C_NULL || socket.slot == C_NULL
+                    socket.debug && @warn "[$(_id(socket))]: c_scheduled_write: channel/slot closed; aborting write"
+                    notify(arg.future, sockerr("channel closed"))
+                    @goto done
+                end
                 n = arg.n
                 socket.debug && @info "[$(_id(socket))]: c_scheduled_write: writing $n bytes"
                 writebufdata = socket.writebuf.data
