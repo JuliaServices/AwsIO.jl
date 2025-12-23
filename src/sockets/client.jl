@@ -186,9 +186,6 @@ function c_process_read_message(handler, slot, messageptr)::Cint
         @atomic sock.window_size -= Int(data.len)
         window_size = @atomic sock.window_size
         sock.debug && @info "[$(_id(sock))]: c_process_read_message: read $(data.len) bytes, sock.window_size = $window_size, slot.window_size = $(slotobj.window_size)"
-        if msg.allocator != C_NULL
-            aws_mem_release(msg.allocator, messageptr)
-        end
     catch e
         close(sock.readbuf)
     end
@@ -437,17 +434,14 @@ Base.eof(sock::Client) = eof(sock.readbuf)
 
 function Base.isopen(sock::Client)
     sock.channel == C_NULL && return false
-    slot = sock.slot
-    slot == C_NULL && return false
-    while slot != C_NULL
-        handler = unsafe_load(slot).handler
-        socket_ptr = aws_socket_handler_get_socket(handler)
-        if socket_ptr != C_NULL
-            return aws_socket_is_open(socket_ptr)
-        end
-        slot = unsafe_load(slot).adj_left
-    end
-    return false
+    sock.slot == C_NULL && return false
+    socket_slot = aws_channel_get_first_slot(sock.channel)
+    socket_slot == C_NULL && return false
+    handler = unsafe_load(socket_slot).handler
+    handler == C_NULL && return false
+    socket_ptr = aws_socket_handler_get_socket(handler)
+    socket_ptr == C_NULL && return false
+    return aws_socket_is_open(socket_ptr)
 end
 
 function Base.close(sock::Client)
