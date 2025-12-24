@@ -4,6 +4,7 @@ _id(obj) = string(objectid(obj); base=58)
 
 # 256KB
 const DEFAULT_READ_BUFFER_SIZE = 256 * 1024
+const DEFAULT_WRITE_BUFFER_SIZE = 64 * 1024
 
 mutable struct Client <: IO
     host::String
@@ -31,6 +32,7 @@ mutable struct Client <: IO
         allocator=default_aws_allocator(),
         client_bootstrap=default_aws_client_bootstrap(),
         buffer_capacity::Int=DEFAULT_READ_BUFFER_SIZE,
+        write_buffer_size::Int=DEFAULT_WRITE_BUFFER_SIZE,
         # socket options
         socket_options::Union{aws_socket_options, Nothing}=nothing,
         socket_type::aws_socket_type=AWS_SOCKET_STREAM,
@@ -68,7 +70,8 @@ mutable struct Client <: IO
                 ntuple(i -> Cchar(0), 16)
             )
         end
-        x = new(host, port, debug, tls, socket_options, C_NULL, buffer_capacity, C_NULL, C_NULL, Base.BufferStream(), buffer_capacity, ReentrantLock(), PipeBuffer(), Future())
+        writebuf = IOBuffer(Vector{UInt8}(undef, write_buffer_size); read=false, write=true, truncate=true)
+        x = new(host, port, debug, tls, socket_options, C_NULL, buffer_capacity, C_NULL, C_NULL, Base.BufferStream(), buffer_capacity, ReentrantLock(), writebuf, Future())
         if tls
             if tls_options === nothing
                 x.tls_options = LibAwsIO.tlsoptions(host;
@@ -392,7 +395,7 @@ function Base.unsafe_write(sock::Client, ref::Ptr{UInt8}, nbytes::UInt)
             schedule_channel_task(sock.channel, SCHEDULED_WRITE[], pointer_from_objref(args), "socket channel write")
             wait(args.future) # wait for write completion
         end
-        skip(sock.writebuf, n) # "consume" the bytes we wrote to our writebuf to reset it for furture writes
+        truncate(sock.writebuf, 0) # reset without reallocating the underlying buffer
         return written
     end
 end
