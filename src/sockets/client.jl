@@ -191,6 +191,11 @@ function c_process_read_message(handler, slot, messageptr)::Cint
         sock.debug && @info "[$(_id(sock))]: c_process_read_message: read $(data.len) bytes, sock.window_size = $window_size, slot.window_size = $(slotobj.window_size)"
     catch e
         close(sock.readbuf)
+    finally
+        # CRITICAL: Release the message after processing.
+        # When process_read_message returns AWS_OP_SUCCESS, the handler takes ownership
+        # of the message and is responsible for releasing it.
+        aws_mem_release(msg.allocator, messageptr)
     end
     return ret
 end
