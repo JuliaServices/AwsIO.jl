@@ -1,5 +1,10 @@
 # AwsIO.jl
 
+> [!WARNING]
+> AwsIO.jl is deprecated and no longer maintained. For sockets and TLS in Julia, use
+> [Reseau.jl](https://github.com/JuliaServices/Reseau.jl). For direct aws-c-io bindings, use
+> [LibAwsIO.jl](https://github.com/JuliaServices/LibAwsIO.jl).
+
 Wrapper library for functionality in the https://github.com/awslabs/aws-c-io library.
 
 The `LibAwsIO` package aims to directly wrap and expose aws-c-io functionality (matching
